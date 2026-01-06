@@ -8,10 +8,37 @@
 
 ## 2026-01-06 更新 (Stability & Performance)
 - **并发安全性优化**：引入 `asyncio.Lock` 保护 SQLite 写入操作，彻底解决多线程/多协程下的 `database is locked` 风险。
-- **异步性能提升**：将所有耗时的阻塞操作（如 SQLite 写入、FAISS 索引保存、PIL 图像处理）全部迁移至线程池（`asyncio.to_thread`），显著降低插件主线程阻塞概率，提升响应速度。
-- **安全性增强 (SSRF 防护)**：为图片下载逻辑增加 SSRF 防护，自动拦截内网、回环及保留地址，确保插件在处理外部 URL 时的安全性。
-- **资源管理优化**：实现基于 `asynccontextmanager` 的临时文件清理机制，确保图片发送后立即释放磁盘空间，防止 `temp/` 目录溢出。
-- **代码健壮性修复**：修复了 `main.py` 中部分异步方法（如 `set_meta` / `delete_meta`）未被正确 await 的问题，消除了潜在的运行时警告与状态不一致。
+- **异步性能提升**：将耗时的阻塞操作（SQLite 写入、FAISS 索引保存、PIL 图像处理）全部迁移至线程池（`asyncio.to_thread`），显著降低插件主线程阻塞概率。
+- **安全性增强 (SSRF 防护)**：为图片下载逻辑增加 SSRF 防护，自动拦截内网、回环及保留地址。
+- **资源管理优化**：实现基于 `asynccontextmanager` 的临时文件清理机制，确保图片发送后立即释放磁盘空间。
+- **代码健壮性修复**：修复了 `main.py` 中部分异步方法（如 `set_meta` / `delete_meta`）未被正确 await 的问题。
+
+## 技术细节 (Librarian Agent Note)
+
+### 并发控制
+插件使用 `asyncio.Lock` 确保对 SQLite 数据库的串行写入。在 `database.py` 中，所有执行 `INSERT` 或 `UPDATE` 的方法均被锁保护，避免了 SQLite 在并发写入时的锁定错误。
+
+### 异步非阻塞设计
+为了不阻塞 AstrBot 的主事件循环，插件采用了“厚异步，薄同步”的策略：
+- **CPU 密集型任务**：如 `FAISS` 索引的序列化与反序列化、图像的缩放与转换，均通过 `asyncio.to_thread` 委派给线程池。
+- **IO 密集型任务**：数据库操作和网络请求均使用异步驱动。
+
+### 安全与资源
+- **SSRF 检查**：在 `media/manager.py` 中，下载图片前会解析 URL 并检查 IP 地址是否属于私有或保留网段。
+- **自动清理**：使用 `TemporaryFileContext` 确保 `temp/` 目录下的中间产物在任务结束后自动删除。
+
+## 安装与配置
+
+### 安装
+1. 将 `astrbot_plugin_mem_chat` 目录放置在 AstrBot 的 `data/plugins/` 目录下。
+2. 重启 AstrBot，插件将自动加载并初始化数据库。
+
+### 配置
+请在 AstrBot WebUI 中配置以下核心项：
+- `custom_llm_base_url`: 你的 LLM API 地址。
+- `custom_llm_api_key`: API 密钥。
+- `llm_model`: 使用的模型（如 `gpt-4o` 或 `gemini-1.5-pro`）。
+- `enable_llm_tools`: 是否启用工具调用（建议关闭以节省 Token）。
 
 ## 2026-01-05 更新 (Testability)
 - `llm_client_parts` 的 `ImageService` / `TtsService` 支持依赖注入（`get_day` / `get_cwd` / `get_data_path`），可在无 AstrBot 运行时下独立实例化与单测。
