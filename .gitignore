@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+
+# Data and Databases
+mem_chat_embeddings.db
+mem_chat_embeddings.db-shm
+mem_chat_embeddings.db-wal
+faiss/
+knowledge/
+temp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
