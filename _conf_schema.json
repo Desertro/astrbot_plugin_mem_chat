@@ -1,0 +1,278 @@
+{
+  "custom_llm_base_url": {
+    "description": "自定义LLM API地址 (OpenAI格式)",
+    "type": "string",
+    "default": ""
+  },
+  "custom_llm_api_key": {
+    "description": "自定义LLM API密钥",
+    "type": "string",
+    "default": ""
+  },
+  "custom_llm_model": {
+    "description": "自定义LLM模型名称",
+    "type": "string",
+    "default": ""
+  },
+  "custom_llm_format": {
+    "description": "自定义LLM载荷格式",
+    "type": "string",
+    "default": "openai",
+    "options": ["openai", "google"],
+    "labels": ["OpenAI格式", "Google Gemini格式"],
+    "hint": "选择与目标平台匹配的请求格式（推荐默认OpenAI）"
+  },
+  "llm_base_url": {
+    "description": "对话 LLM API地址 (默认继承 custom_llm_base_url)",
+    "type": "string",
+    "default": ""
+  },
+  "llm_api_key": {
+    "description": "对话 LLM API密钥 (默认继承 custom_llm_api_key)",
+    "type": "string",
+    "default": ""
+  },
+  "llm_model": {
+    "description": "对话 LLM模型名称 (默认继承 custom_llm_model)",
+    "type": "string",
+    "default": ""
+  },
+  "llm_format": {
+    "description": "对话 LLM载荷格式",
+    "type": "string",
+    "default": "openai",
+    "options": ["openai", "google"],
+    "labels": ["OpenAI格式", "Google Gemini格式"],
+    "hint": "选择请求格式"
+  },
+  "llm_temperature": {
+    "description": "对话 LLM温度 (0.0-2.0)",
+    "type": "float",
+    "default": 1.0,
+    "hint": "控制对话回复的随机性，较高值更具创造性"
+  },
+  "force_llm_json_output": {
+    "description": "强制 LLM 输出纯 JSON（若接口支持）",
+    "type": "bool",
+    "default": false,
+    "hint": "对 OpenAI 兼容接口会尝试启用 response_format=json_object；对 Gemini 会尝试启用 responseMimeType=application/json。若接口不支持可能会报 400，请关闭。"
+  },
+  "enable_llm": {
+    "description": "启用LLM调用",
+    "type": "bool",
+    "default": true
+  },
+  "enable_llm_tools": {
+    "description": "启用 LLM 工具（Function Calling）",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭后将不向对话 LLM 注入 tools schema，也不会执行任何 tool_call，可显著减少提示词长度与 token 消耗。"
+  },
+  "heartbeat_cycle": {
+    "description": "心跳周期(秒)",
+    "type": "int",
+    "default": 60
+  },
+  "focus_mode_cycle": {
+    "description": "专注模式周期(秒)",
+    "type": "int",
+    "default": 15
+  },
+  "focus_duration_sec": {
+    "description": "专注模式时长(秒)",
+    "type": "int",
+    "default": 180
+  },
+  "debug_auto_pass": {
+    "description": "心跳自动进入专注(调试)",
+    "type": "bool",
+    "default": false
+  },
+  "group_whitelist": {
+    "description": "群聊白名单（Group ID 列表）",
+    "type": "list",
+    "items": {"type": "string"},
+    "default": []
+  },
+  "history_message_count": {
+    "description": "最近历史消息条数",
+    "type": "int",
+    "default": 12
+  },
+  "task_timeout_sec_focus": {
+    "description": "专注任务超时(秒)",
+    "type": "int",
+    "default": 60,
+    "hint": "任务从入队到调用 LLM 前的允许等待时间"
+  },
+  "task_timeout_sec_read_air": {
+    "description": "读空气任务超时(秒)",
+    "type": "int",
+    "default": 120,
+    "hint": "读空气可能包含较重的记忆召回，建议设置更高"
+  },
+  "decision_prompt_template": {
+    "description": "读空气判定提示词模板",
+    "type": "string",
+    "default": "【读空气判定】\n会话: {umo}\n任务: 根据【最新消息上下文】判断是否需要回复。\n- 不需要回复：请输出结构化 JSON，control.decision=\"no_reply\"。\n- 需要回复：请输出结构化 JSON，control.decision=\"reply_only\"，并在 response.text 写出回复内容。\n- 若需要分别对多人/多条内容回应：使用 response.segments 输出多条消息（每个 segment 可包含 text/mentions/quote_index）。\n禁止输出 [DO_NOT_REPLY] 等旧标记。"
+  },
+  "focus_prompt_template": {
+    "description": "专注回复提示词模板",
+    "type": "string",
+    "default": "【专注回复】\n会话: {umo}\n任务: 请根据【最新消息上下文】回复用户。你必须输出结构化 JSON。\n- 需要回复：control.decision=\"reply_only\"，可在 response.text 写一条回复；若要对多人/多条上下文分别回应，请用 response.segments 输出多条消息（每个 segment 可包含 text/mentions/quote_index）。\n- 不需要回复：control.decision=\"no_reply\"。"
+  },
+  "decision_msg_count_max": {
+    "description": "读空气消息上限(大于此值不判定)",
+    "type": "int",
+    "default": 100
+  },
+  "decision_msg_count_min": {
+    "description": "读空气消息下限(小于此值不判定)",
+    "type": "int",
+    "default": 1
+  },
+  "enable_enhanced_memory": {
+    "description": "启用增强记忆",
+    "type": "bool",
+    "default": true
+  },
+  "max_injected_memories": {
+    "description": "注入记忆条数",
+    "type": "int",
+    "default": 5
+  },
+  "memory_injection_threshold": {
+    "description": "记忆相关性阈值",
+    "type": "float",
+    "default": 0.3
+  },
+  "enable_impression_injection": {
+    "description": "启用人物印象注入",
+    "type": "bool",
+    "default": true
+  },
+  "semantic_recall_scan_limit_memory": {
+    "description": "记忆语义召回扫描上限(条)",
+    "type": "int",
+    "default": 8000,
+    "hint": "条数越大越全面但越慢；0 表示扫描全部"
+  },
+  "semantic_recall_scan_limit_impression": {
+    "description": "印象语义召回扫描上限(条)",
+    "type": "int",
+    "default": 2000,
+    "hint": "条数越大越全面但越慢；0 表示扫描全部"
+  },
+  "enable_faiss_recall": {
+    "description": "启用FAISS语义召回加速",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后使用本地 FAISS 索引替代 SQLite 全表扫描进行召回"
+  },
+  "faiss_index_dir": {
+    "description": "FAISS索引目录(留空自动)",
+    "type": "string",
+    "default": "",
+    "hint": "留空默认使用插件目录下的 faiss/ 目录"
+  },
+  "faiss_autosave_interval_sec": {
+    "description": "FAISS索引自动保存间隔(秒)",
+    "type": "int",
+    "default": 30,
+    "hint": "0 表示每次更新都保存；负数表示不自动保存"
+  },
+  "faiss_search_k": {
+    "description": "FAISS检索候选数量",
+    "type": "int",
+    "default": 200,
+    "hint": "越大越准确但更慢；建议 >= 注入条数的 8 倍"
+  },
+  "embedding_openai_base_url": {
+    "description": "OpenAI格式嵌入API地址",
+    "type": "string",
+    "default": ""
+  },
+  "embedding_openai_api_key": {
+    "description": "OpenAI格式嵌入API密钥",
+    "type": "string",
+    "default": ""
+  },
+  "embedding_openai_model": {
+    "description": "OpenAI嵌入模型",
+    "type": "string",
+    "default": "text-embedding-3-small"
+  },
+  "vision_llm": {
+    "description": "快速图片处理LLM配置",
+    "type": "object",
+    "default": {
+      "enable": false,
+      "provider": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "",
+      "model": "gpt-4o-mini",
+      "prompt": "请简要描述这张图片的内容，50字以内。",
+      "format": "openai"
+    },
+    "items": {
+      "enable": {"type": "bool", "description": "启用"},
+      "provider": {"type": "string", "description": "提供商"},
+      "base_url": {"type": "string", "description": "API地址"},
+      "api_key": {"type": "string", "description": "API密钥"},
+      "model": {"type": "string", "description": "模型名称"},
+      "prompt": {"type": "string", "description": "提示词"},
+      "format": {
+        "type": "string",
+        "description": "载荷格式",
+        "options": ["openai", "google"],
+        "labels": ["OpenAI格式", "Google Gemini格式"],
+        "default": "openai"
+      }
+    }
+  },
+  "chat_model_supports_vision": {
+    "description": "聊天模型是否支持识图功能",
+    "type": "bool",
+    "default": false
+  },
+  "vision_image_cache_enable": {
+    "description": "启用群聊重复图片视觉描述缓存（非 @ 消息）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会把图片 file/url 归一化后写入本地 SQLite，并复用缓存的 [图片内容: ...]，减少视觉 LLM 调用。"
+  },
+  "vision_image_cache_ttl_days": {
+    "description": "图片视觉描述缓存有效期(天)",
+    "type": "int",
+    "default": 30,
+    "hint": "超过有效期的缓存不会被使用，并会在写入时自动清理。"
+  },
+  "vision_image_cache_max_records": {
+    "description": "图片视觉描述缓存最大记录数(每群)",
+    "type": "int",
+    "default": 20000,
+    "hint": "超过后会按最后出现时间从旧到新裁剪。"
+  },
+  "debug_log_memory_context": {
+    "description": "打印记忆上下文日志",
+    "type": "bool",
+    "default": true
+  },
+  "log_llm_prompt": {
+    "description": "打印 LLM 提示词日志",
+    "type": "bool",
+    "default": true
+  },
+  "log_llm_prompt_full": {
+    "description": "打印 LLM 完整提示词与系统提示词",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后日志会很长，建议仅排查问题时使用"
+  },
+  "log_llm_contexts_full": {
+    "description": "打印 LLM 完整上下文 messages",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后日志可能极长；会自动省略 data:image base64"
+  }
+}
