@@ -18,8 +18,14 @@
     "description": "自定义LLM载荷格式",
     "type": "string",
     "default": "openai",
-    "options": ["openai", "google"],
-    "labels": ["OpenAI格式", "Google Gemini格式"],
+    "options": [
+      "openai",
+      "google"
+    ],
+    "labels": [
+      "OpenAI格式",
+      "Google Gemini格式"
+    ],
     "hint": "选择与目标平台匹配的请求格式（推荐默认OpenAI）"
   },
   "llm_base_url": {
@@ -41,8 +47,14 @@
     "description": "对话 LLM载荷格式",
     "type": "string",
     "default": "openai",
-    "options": ["openai", "google"],
-    "labels": ["OpenAI格式", "Google Gemini格式"],
+    "options": [
+      "openai",
+      "google"
+    ],
+    "labels": [
+      "OpenAI格式",
+      "Google Gemini格式"
+    ],
     "hint": "选择请求格式"
   },
   "llm_temperature": {
@@ -50,6 +62,12 @@
     "type": "float",
     "default": 1.0,
     "hint": "控制对话回复的随机性，较高值更具创造性"
+  },
+  "llm_max_tokens": {
+    "description": "对话 LLM最大输出Token",
+    "type": "int",
+    "default": 3072,
+    "hint": "DeepSeek JSON Output 建议合理设置 max_tokens，避免 JSON 被中途截断。"
   },
   "force_llm_json_output": {
     "description": "强制 LLM 输出纯 JSON（若接口支持）",
@@ -68,20 +86,170 @@
     "default": false,
     "hint": "关闭后将不向对话 LLM 注入 tools schema，也不会执行任何 tool_call，可显著减少提示词长度与 token 消耗。"
   },
+  "llm_tools_restrict_enabled": {
+    "description": "限制 mem_chat 可调用工具（白名单）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后仅允许名称匹配 llm_tools_allowed_patterns 的工具。"
+  },
+  "llm_tools_allowed_patterns": {
+    "description": "工具名白名单关键词（逗号分隔）",
+    "type": "string",
+    "default": "",
+    "hint": "按工具名包含匹配；为空时会禁用所有工具。"
+  },
+  "llm_tools_allowed_names": {
+    "description": "工具精确名称白名单",
+    "type": "list",
+    "default": [],
+    "hint": "限制工具开启且此列表非空时，仅允许精确列出的工具，优先于关键词白名单。"
+  },
+  "llm_agent_max_steps": {
+    "description": "Agent 最大模型轮数",
+    "type": "int",
+    "default": 4,
+    "hint": "限制为 2～6 轮，最后一轮仅整理答案；每次任务最多执行 6 次工具调用。"
+  },
+  "llm_tool_timeout_sec": {
+    "description": "单次工具超时秒数",
+    "type": "int",
+    "default": 30,
+    "hint": "限制为 1～60 秒，超时后将错误交给模型处理。"
+  },
+  "provider_settings": {
+    "description": "外部工具提供方设置",
+    "type": "object",
+    "hint": "用于切换联网搜索等工具提供方。",
+    "items": {
+      "websearch_provider": {
+        "description": "联网搜索提供方",
+        "type": "string",
+        "default": "default",
+        "options": [
+          "default",
+          "ark",
+          "tavily",
+          "deepseek"
+        ],
+        "labels": [
+          "默认搜索",
+          "火山方舟 Ark",
+          "Tavily",
+          "DeepSeek 官方搜索"
+        ],
+        "hint": "选择 deepseek 时使用 deepseek_web_search 和 deepseek_web_fetch；需安装并配置 DeepSeek 搜索插件。"
+      }
+    }
+  },
+  "deepseek_tool_strict_mode": {
+    "description": "DeepSeek 工具 Strict 模式（Beta）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后 DeepSeek 工具调用会走 /beta，并给 function 添加 strict=true；会自动整理 JSON Schema，但仍可能因插件工具 schema 不兼容而报错。"
+  },
+  "llm_tool_result_max_chars": {
+    "description": "工具返回结果最大字符数",
+    "type": "int",
+    "default": 6000,
+    "hint": "限制 role=tool 回填给模型的文本长度，避免搜索/网页工具返回过长导致下一轮上下文膨胀。0 表示不截断。"
+  },
+  "read_air_enable": {
+    "description": "启用读空气模式",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后仅在 @ / 专注模式触发回复，不再进行读空气判定与定时回复。"
+  },
   "heartbeat_cycle": {
     "description": "心跳周期(秒)",
     "type": "int",
     "default": 60
+  },
+  "raw_messages_backfill_on_startup": {
+    "description": "启动时回填历史到raw消息表",
+    "type": "bool",
+    "default": true,
+    "hint": "首次开启后会把 memory_embeddings 中可解析历史写入 raw_group_messages，仅执行一次（除非强制）。"
+  },
+  "raw_messages_backfill_batch_size": {
+    "description": "raw历史回填批大小",
+    "type": "int",
+    "default": 2000,
+    "hint": "每批处理的 memory_embeddings 条数。"
+  },
+  "raw_messages_backfill_force": {
+    "description": "强制重复回填raw历史",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后每次启动都会再次扫描并尝试补写（INSERT OR IGNORE）。"
+  },
+  "user_aliases_backfill_on_startup": {
+    "description": "启动时回填用户昵称别名",
+    "type": "bool",
+    "default": true,
+    "hint": "首次开启后从 raw_group_messages 中按 QQ 号补全群昵称/曾用名，仅执行一次（除非强制）。"
+  },
+  "user_aliases_backfill_batch_size": {
+    "description": "用户昵称别名回填批大小",
+    "type": "int",
+    "default": 5000
+  },
+  "user_aliases_backfill_force": {
+    "description": "强制重复回填用户昵称别名",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后每次启动都会重新扫描 raw_group_messages 并刷新别名表。"
   },
   "focus_mode_cycle": {
     "description": "专注模式周期(秒)",
     "type": "int",
     "default": 15
   },
+  "focus_cycle_min_sec": {
+    "description": "专注回复周期下限(秒)",
+    "type": "int",
+    "default": 8
+  },
+  "focus_cycle_max_sec": {
+    "description": "专注回复周期上限(秒)",
+    "type": "int",
+    "default": 120
+  },
+  "focus_cycle_step_max_sec": {
+    "description": "专注回复周期单次最大变动(秒)",
+    "type": "int",
+    "default": 20
+  },
   "focus_duration_sec": {
     "description": "专注模式时长(秒)",
     "type": "int",
     "default": 180
+  },
+  "focus_duration_min_sec": {
+    "description": "专注模式时长下限(秒)",
+    "type": "int",
+    "default": 60
+  },
+  "focus_duration_max_sec": {
+    "description": "专注模式时长上限(秒)",
+    "type": "int",
+    "default": 900
+  },
+  "focus_duration_step_max_sec": {
+    "description": "专注模式时长单次最大变动(秒)",
+    "type": "int",
+    "default": 120
+  },
+  "focus_non_at_use_decision_prompt": {
+    "description": "专注周期内无@时使用读空气判定（允许不回复）",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后在专注周期内没有任何消息显式@机器人时，改用读空气判定模板（decision_prompt），LLM可输出 control.decision=\"no_reply\"。"
+  },
+  "read_air_compact_prompt_enabled": {
+    "description": "读空气使用紧凑提示词",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后读空气场景将注入更短的规则块，减少 token 浪费并强化 no_reply 判断。"
   },
   "debug_auto_pass": {
     "description": "心跳自动进入专注(调试)",
@@ -91,7 +259,17 @@
   "group_whitelist": {
     "description": "群聊白名单（Group ID 列表）",
     "type": "list",
-    "items": {"type": "string"},
+    "items": {
+      "type": "string"
+    },
+    "default": []
+  },
+  "private_chat_uids": {
+    "description": "允许私聊的用户 QQ 号（留空则关闭私聊）",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
     "default": []
   },
   "history_message_count": {
@@ -99,11 +277,363 @@
     "type": "int",
     "default": 12
   },
+  "max_injected_memories_non_at": {
+    "description": "非AT场景注入记忆上限",
+    "type": "int",
+    "default": 18,
+    "hint": "用于 focus/read_air，限制【相关记忆】注入条数以减少 token。"
+  },
+  "max_injected_memories_at": {
+    "description": "AT场景注入记忆上限",
+    "type": "int",
+    "default": 18,
+    "hint": "用于显式 @ 回复，限制【相关记忆】注入条数，避免上下文构建拖慢唤醒回复。"
+  },
+  "max_injected_knowledge_non_at": {
+    "description": "非AT场景注入知识上限",
+    "type": "int",
+    "default": 2,
+    "hint": "用于 focus/read_air，限制【相关知识】注入条数以减少 token。"
+  },
+  "history_lines_limit_focus": {
+    "description": "focus 历史对话注入上限",
+    "type": "int",
+    "default": 20,
+    "hint": "用于 focus，超过后仅保留最近 N 条历史对话。0 表示不限制。"
+  },
+  "history_lines_limit_read_air": {
+    "description": "read_air 历史对话注入上限",
+    "type": "int",
+    "default": 12,
+    "hint": "用于 read_air，超过后仅保留最近 N 条历史对话。0 表示不限制。"
+  },
+  "history_time_gap_minutes": {
+    "description": "历史时间锚点间隔(分钟)",
+    "type": "int",
+    "default": 15,
+    "hint": "当两条历史消息时间差超过该值时，在提示词里插入类似聊天软件的时间分隔线。"
+  },
+  "history_time_marker_every_n": {
+    "description": "历史时间锚点消息步长",
+    "type": "int",
+    "default": 4,
+    "hint": "即使没有明显时间间隔，每累计 N 条历史消息也会补一个时间分隔线。"
+  },
+  "history_fetch_factor": {
+    "description": "历史窗口超采样倍率",
+    "type": "int",
+    "default": 4,
+    "hint": "会先读取 history_message_count * 倍率 条，再按预算动态裁剪。"
+  },
+  "history_fetch_cap": {
+    "description": "历史窗口最大读取条数",
+    "type": "int",
+    "default": 120,
+    "hint": "用于限制超采样上限，避免会话特别长时扫描过多历史。"
+  },
+  "history_char_budget": {
+    "description": "历史窗口字符预算(默认)",
+    "type": "int",
+    "default": 3200,
+    "hint": "动态窗口按字符预算裁剪，替代固定条数硬截断。"
+  },
+  "memory_context_total_budget_chars": {
+    "description": "memory_context 总字符预算",
+    "type": "int",
+    "default": 12000,
+    "hint": "按优先级分配：历史对话 > 当前人物印象 > 相关印象 > 召回记忆 > 知识库。0 表示不限制。"
+  },
+  "history_char_budget_at": {
+    "description": "AT任务历史窗口字符预算",
+    "type": "int",
+    "default": 4200
+  },
+  "history_char_budget_focus": {
+    "description": "focus任务历史窗口字符预算",
+    "type": "int",
+    "default": 3200
+  },
+  "history_char_budget_read_air": {
+    "description": "read_air任务历史窗口字符预算",
+    "type": "int",
+    "default": 2400
+  },
+  "history_min_lines": {
+    "description": "历史窗口最少保留条数(默认)",
+    "type": "int",
+    "default": 4
+  },
+  "history_min_lines_focus": {
+    "description": "focus任务历史窗口最少保留条数",
+    "type": "int",
+    "default": 4
+  },
+  "history_min_lines_read_air": {
+    "description": "read_air任务历史窗口最少保留条数",
+    "type": "int",
+    "default": 3
+  },
+  "history_include_assistant": {
+    "description": "历史窗口包含助手历史",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后只注入用户侧历史消息，可进一步减少噪声。"
+  },
+  "ref_context_window": {
+    "description": "引用索引上下文窗口(条)",
+    "type": "int",
+    "default": 30,
+    "hint": "用于 [REF:n] 编号、quote_index/撤回/精华等动作的候选消息数量上限；0 表示复用 at_pending_max_msgs"
+  },
+  "ref_context_include_referenced": {
+    "description": "将被引用消息纳入 [REF] 编号",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会把最近消息中 Reply 引用到的消息也编号，便于正确引用/撤回/精华"
+  },
+  "reply_targets_ttl_sec": {
+    "description": "引用目标映射保留时长(秒)",
+    "type": "int",
+    "default": 604800,
+    "hint": "用于 use_replied_target 等场景，超过该时长的映射会被清理"
+  },
+  "reply_targets_max_size": {
+    "description": "引用目标映射最大条数",
+    "type": "int",
+    "default": 4096,
+    "hint": "超出后会按最旧优先清理"
+  },
+  "reply_summaries_ttl_sec": {
+    "description": "被引用消息摘要保留时长(秒)",
+    "type": "int",
+    "default": 604800,
+    "hint": "用于在 [REF:n] 中展示被引用消息内容，超过该时长的摘要会被清理"
+  },
+  "reply_summaries_max_size": {
+    "description": "被引用消息摘要最大条数",
+    "type": "int",
+    "default": 4096,
+    "hint": "超出后会按最旧优先清理"
+  },
+  "reply_quote_max_age_sec": {
+    "description": "普通回复可引用消息最大年龄(秒)",
+    "type": "int",
+    "default": 1800,
+    "hint": "超过该时长的候选消息将不再用于普通回复 quote_index；0 表示不限制。"
+  },
+  "quote_follow_latest_enabled": {
+    "description": "单段回复引用跟随最新条目",
+    "type": "bool",
+    "default": true,
+    "hint": "在 focus/read_air 且非多段回复时，若模型给出 quote_index 将优先对齐到【需要你优先处理的最新一条】对应的 REF。"
+  },
+  "admin_protocols_inject_mode": {
+    "description": "群管协议注入模式",
+    "type": "string",
+    "default": "off",
+    "options": [
+      "off",
+      "auto",
+      "always"
+    ],
+    "labels": [
+      "关闭",
+      "自动",
+      "总是注入"
+    ],
+    "hint": "关闭后不注入管理协议文本；自动模式仅在消息包含禁言/撤回/精华等意图时注入。"
+  },
+  "admin_actions_enabled": {
+    "description": "启用群管控制执行",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭后将忽略 LLM 输出的 control.mute/unmute/recall/set_group_essence 等群管控制字段。"
+  },
+  "recall_nsfw_score_threshold": {
+    "description": "撤回敏感内容分数阈值(0-100)",
+    "type": "int",
+    "default": 99,
+    "hint": "仅当 control.recall.score 或 targets.score ≥ 阈值时执行撤回"
+  },
+  "mood_enabled": {
+    "description": "启用心境变量",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后要求 LLM 每次输出 mood.text，并在下一轮 system prompt 注入【上一轮心境】。"
+  },
+  "mood_negative_ttl_cap_enabled": {
+    "description": "负面心境 TTL 上限开关",
+    "type": "bool",
+    "default": true
+  },
+  "mood_persistent_states": {
+    "description": "常驻心境状态列表",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [
+      "色色"
+    ],
+    "hint": "列表内状态会忽略 LLM 输出的 mood.ttl_sec，不因 TTL 自动回落到中性；后续 LLM 明确输出其他 mood 时仍可切换。"
+  },
+  "mood_ttl_cap_sarcasm_sec": {
+    "description": "讥讽心境最大 TTL(秒)",
+    "type": "int",
+    "default": 300
+  },
+  "mood_ttl_cap_angry_sec": {
+    "description": "生气心境最大 TTL(秒)",
+    "type": "int",
+    "default": 600
+  },
+  "mood_ttl_cap_timid_sec": {
+    "description": "软懦心境最大 TTL(秒)",
+    "type": "int",
+    "default": 300
+  },
+  "affinity_enabled": {
+    "description": "启用关系好感系统",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会根据 mood 状态更新每个群成员的 affinity/trust，并注入【关系倾向】。"
+  },
+  "affinity_update_require_at": {
+    "description": "仅在点名机器人时更新好感",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后仅在 AT/点名机器人场景写入 affinity，避免误把群聊路人消息计入关系变化。"
+  },
+  "affinity_mood_delta_enabled": {
+    "description": "启用 mood 对好感的影响",
+    "type": "bool",
+    "default": true,
+    "hint": "兼容旧逻辑：当启用 affinity_llm_fallback_to_mood 且 LLM 未输出 affinity.delta 时才会使用。"
+  },
+  "affinity_interaction_base_bonus": {
+    "description": "命中互动时基础加分",
+    "type": "float",
+    "default": 1.5
+  },
+  "affinity_interaction_at_bonus": {
+    "description": "@机器人额外加分",
+    "type": "float",
+    "default": 2.0
+  },
+  "affinity_interaction_reply_bonus": {
+    "description": "引用机器人消息额外加分",
+    "type": "float",
+    "default": 2.5
+  },
+  "affinity_interaction_poke_bonus": {
+    "description": "戳机器人额外加分",
+    "type": "float",
+    "default": 2.5
+  },
+  "affinity_interaction_activity_per_msg": {
+    "description": "每条近期活跃消息的加分",
+    "type": "float",
+    "default": 0.25,
+    "hint": "根据 history_message_count 窗口中该用户出现次数累计。"
+  },
+  "affinity_interaction_activity_cap": {
+    "description": "活跃度加分上限",
+    "type": "float",
+    "default": 6.0,
+    "hint": "兼容旧逻辑参数，当前 LLM 主导模式默认不使用。"
+  },
+  "affinity_llm_signal_max_age_sec": {
+    "description": "LLM affinity 信号最大有效时长(秒)",
+    "type": "int",
+    "default": 600
+  },
+  "affinity_llm_fallback_to_mood": {
+    "description": "缺失 LLM affinity 时回退 mood 映射",
+    "type": "bool",
+    "default": false
+  },
+  "affinity_new_user_correction_enabled": {
+    "description": "启用新用户系数补正",
+    "type": "bool",
+    "default": true,
+    "hint": "仅做幅度缩放，不改变 LLM 判断的加减方向。"
+  },
+  "affinity_new_user_window_events": {
+    "description": "新用户补正窗口（前 N 次事件）",
+    "type": "int",
+    "default": 8
+  },
+  "affinity_new_user_factor_start": {
+    "description": "新用户初始系数",
+    "type": "float",
+    "default": 0.4
+  },
+  "affinity_new_user_factor_end": {
+    "description": "新用户窗口结束系数",
+    "type": "float",
+    "default": 1.0
+  },
+  "affinity_poke_bonus_force": {
+    "description": "戳一戳机器人时强制额外加分",
+    "type": "float",
+    "default": 12.0,
+    "hint": "视为强正向互动，直接追加到本轮 affinity.delta。"
+  },
+  "affinity_poke_min_delta": {
+    "description": "戳一戳机器人时本轮最小增量",
+    "type": "float",
+    "default": 10.0,
+    "hint": "若 LLM 判定过低或为负，仍会抬升到该最小值。"
+  },
+  "affinity_poke_ignore_cooldown": {
+    "description": "戳一戳机器人时忽略冷却",
+    "type": "bool",
+    "default": true
+  },
+  "affinity_poke_preapply_before_prompt": {
+    "description": "戳一戳先加好感再构建提示词",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后先写入一次 poke 最小增量，再进行 LLM 推理，避免先被模型负向评价。"
+  },
+  "affinity_delta_cooldown_sec": {
+    "description": "好感变更冷却(秒)",
+    "type": "int",
+    "default": 120,
+    "hint": "同一用户在冷却期内最多应用一次 affinity 变化。"
+  },
+  "affinity_decay_enabled": {
+    "description": "启用好感自然回归",
+    "type": "bool",
+    "default": true,
+    "hint": "让好感在长时间无互动后缓慢回到中性。"
+  },
+  "affinity_decay_interval_sec": {
+    "description": "好感回归巡检周期(秒)",
+    "type": "int",
+    "default": 1800
+  },
+  "affinity_decay_step": {
+    "description": "好感每次回归步长",
+    "type": "float",
+    "default": 1.0
+  },
+  "affinity_decay_idle_sec": {
+    "description": "触发回归的最小空闲时长(秒)",
+    "type": "int",
+    "default": 3600
+  },
   "task_timeout_sec_focus": {
     "description": "专注任务超时(秒)",
     "type": "int",
     "default": 60,
     "hint": "任务从入队到调用 LLM 前的允许等待时间"
+  },
+  "task_timeout_sec_at": {
+    "description": "AT任务超时(秒)",
+    "type": "int",
+    "default": 90,
+    "hint": "显式 @ 的整体任务预算；设置为 0 表示不按等待时间丢弃。"
   },
   "task_timeout_sec_read_air": {
     "description": "读空气任务超时(秒)",
@@ -114,12 +644,12 @@
   "decision_prompt_template": {
     "description": "读空气判定提示词模板",
     "type": "string",
-    "default": "【读空气判定】\n会话: {umo}\n任务: 根据【最新消息上下文】判断是否需要回复。\n- 不需要回复：请输出结构化 JSON，control.decision=\"no_reply\"。\n- 需要回复：请输出结构化 JSON，control.decision=\"reply_only\"，并在 response.text 写出回复内容。\n- 若需要分别对多人/多条内容回应：使用 response.segments 输出多条消息（每个 segment 可包含 text/mentions/quote_index）。\n禁止输出 [DO_NOT_REPLY] 等旧标记。"
+    "default": "【读空气判定】\n会话: {umo}\n任务: 根据【最新消息上下文】判断是否需要回复。\n- 不需要回复：请输出结构化 JSON，control.decision=\"no_reply\"。\n- 需要回复：请输出结构化 JSON，control.decision=\"reply_only\"。\n- 单句短回复可写 response.text。\n- 多人、多条消息、多个问题、先接话再补充、情绪反应与实用信息分离时，优先使用 response.segments 输出多条消息（建议2-4段，每段一个意图，可包含 text/mentions/quote_index）。\n- 使用 response.segments 时，response.text 建议留空，避免重复。\n禁止输出 [DO_NOT_REPLY] 等旧标记。"
   },
   "focus_prompt_template": {
     "description": "专注回复提示词模板",
     "type": "string",
-    "default": "【专注回复】\n会话: {umo}\n任务: 请根据【最新消息上下文】回复用户。你必须输出结构化 JSON。\n- 需要回复：control.decision=\"reply_only\"，可在 response.text 写一条回复；若要对多人/多条上下文分别回应，请用 response.segments 输出多条消息（每个 segment 可包含 text/mentions/quote_index）。\n- 不需要回复：control.decision=\"no_reply\"。"
+    "default": "【专注回复】\n会话: {umo}\n任务: 请根据【最新消息上下文】回复用户。你必须输出结构化 JSON。\n- 需要回复：control.decision=\"reply_only\"。\n- 单句短回复可写 response.text。\n- 多人、多条消息、多个问题、先短句接话再补充、情绪反应与实用信息分离、内容超过约60个汉字且可自然拆分时，优先使用 response.segments 输出多条消息（建议2-4段，每段一个意图，可包含 text/mentions/quote_index）。\n- 使用 response.segments 时，response.text 建议留空，避免重复。\n- 不需要回复：control.decision=\"no_reply\"。"
   },
   "decision_msg_count_max": {
     "description": "读空气消息上限(大于此值不判定)",
@@ -151,17 +681,183 @@
     "type": "bool",
     "default": true
   },
+  "impression_semantic_enabled": {
+    "description": "启用人物印象语义召回",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会从 impression 向量库召回与本轮对话语义相关的人物印象。"
+  },
+  "impression_semantic_at_enabled": {
+    "description": "AT场景启用相关人物语义印象",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭时 AT 仍会注入当前发言人/本轮参与者印象，但跳过较慢的相关人物语义召回。"
+  },
+  "impression_v3_enabled": {
+    "description": "启用 Impression V3 新印象库",
+    "type": "bool",
+    "default": true,
+    "hint": "启用后优先使用 impression_profiles_v3 / impression_facts_v3 / impression_embeddings_v3 进行注入与召回。"
+  },
+  "impression_stream_enabled": {
+    "description": "启用印象流式写入",
+    "type": "bool",
+    "default": true,
+    "hint": "由 read_air/focus 的日常对话输出 impression_delta/session_impression_summary，实时更新印象库。"
+  },
+  "impression_stream_read_air_delta": {
+    "description": "读空气周期输出印象增量",
+    "type": "bool",
+    "default": true
+  },
+  "impression_stream_focus_delta": {
+    "description": "专注周期输出印象增量",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后专注对话中也会持续输出 impression_delta，使机器人更及时记住人物偏好、外号与互动习惯。"
+  },
+  "impression_stream_focus_final": {
+    "description": "专注结束轮输出印象总结",
+    "type": "bool",
+    "default": true
+  },
+  "impression_focus_end_threshold_sec": {
+    "description": "判定为专注结束轮的剩余时长阈值(秒)",
+    "type": "int",
+    "default": 10
+  },
+  "impression_active_only": {
+    "description": "仅注入本轮活跃用户印象",
+    "type": "bool",
+    "default": true,
+    "hint": "只保留当前发言人和本轮消息中出现过的用户，避免无关人物印象污染。"
+  },
+  "impression_sender_pinned": {
+    "description": "固定注入当前发言人印象",
+    "type": "bool",
+    "default": true,
+    "hint": "无论是否命中语义召回，优先注入当前发言人的人物印象。"
+  },
+  "impression_merge_recent_participants": {
+    "description": "按最新消息参与者合并注入人物印象",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会把本轮最新消息中出现过的用户汇总到【人物印象】，并在同区块展示该用户关系倾向(affinity/trust/bias)。"
+  },
+  "impression_recent_max_persons": {
+    "description": "最新参与者人物印象上限",
+    "type": "int",
+    "default": 10,
+    "hint": "控制【人物印象】里按最新消息汇总展示的人数上限。"
+  },
+  "impression_recent_max_persons_at": {
+    "description": "AT场景最新参与者人物印象上限",
+    "type": "int",
+    "default": 6,
+    "hint": "显式 @ 回复时限制【人物印象】参与者人数，降低上下文长度。"
+  },
+  "impression_related_max_persons": {
+    "description": "语义召回相关人物上限",
+    "type": "int",
+    "default": 5
+  },
+  "impression_related_max_persons_at": {
+    "description": "AT场景语义相关人物上限",
+    "type": "int",
+    "default": 3
+  },
+  "max_impressions_per_person_at": {
+    "description": "AT场景每人印象条数上限",
+    "type": "int",
+    "default": 2
+  },
+  "impression_semantic_extra_nonrecent_max_persons": {
+    "description": "语义追加窗口外人物上限",
+    "type": "int",
+    "default": 4,
+    "hint": "当开启“按最新参与者合并注入”时，仅追加不在最新窗口中的相关人物，范围1~4。"
+  },
+  "impression_related_score_min": {
+    "description": "语义召回相关人物阈值",
+    "type": "float",
+    "default": 0.45
+  },
+  "impression_token_budget": {
+    "description": "相关人物印象注入预算(字符)",
+    "type": "int",
+    "default": 900,
+    "hint": "仅限制【人物印象-相关人物】区块长度；0 表示不限制。"
+  },
+  "impression_token_budget_at": {
+    "description": "AT场景相关人物印象预算(字符)",
+    "type": "int",
+    "default": 700,
+    "hint": "显式 @ 回复时限制印象区块长度；0 表示不限制。"
+  },
+  "profile_v2_enabled": {
+    "description": "启用人物印象V2（按QQ号画像）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后人物印象按 group_id+user_id(QQ号) 存入 user_profiles，并写入带 uid 的 IMPR2 向量条目，避免同昵称/同summary错配。"
+  },
+  "legacy_periodic_profile_enabled": {
+    "description": "启用旧版每N条消息批处理画像",
+    "type": "bool",
+    "default": false,
+    "hint": "新架构已改为日常对话增量写入。仅兼容旧流程时开启。"
+  },
+  "legacy_periodic_profile_every_n_msgs": {
+    "description": "旧版批处理画像触发条数",
+    "type": "int",
+    "default": 50
+  },
   "semantic_recall_scan_limit_memory": {
     "description": "记忆语义召回扫描上限(条)",
     "type": "int",
     "default": 8000,
     "hint": "条数越大越全面但越慢；0 表示扫描全部"
   },
+  "semantic_recall_scan_limit_memory_at": {
+    "description": "AT场景记忆语义召回扫描上限(条)",
+    "type": "int",
+    "default": 1200,
+    "hint": "显式 @ 回复使用较小扫描窗口，避免上下文构建超过任务预算；0 表示扫描全部。"
+  },
+  "memory_time_decay_enabled": {
+    "description": "记忆召回启用时间衰减",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后久远记忆会在相似度上衰减，减少旧梗长期污染。"
+  },
+  "memory_time_decay_half_life_sec": {
+    "description": "记忆时间衰减半衰期(秒)",
+    "type": "int",
+    "default": 604800,
+    "hint": "默认7天，越小表示越偏向近期消息。"
+  },
+  "memory_time_decay_min_factor": {
+    "description": "记忆时间衰减最小系数",
+    "type": "float",
+    "default": 0.3,
+    "hint": "避免老记忆完全失效，建议0.2~0.5。"
+  },
   "semantic_recall_scan_limit_impression": {
     "description": "印象语义召回扫描上限(条)",
     "type": "int",
-    "default": 2000,
+    "default": 3000,
     "hint": "条数越大越全面但越慢；0 表示扫描全部"
+  },
+  "semantic_recall_scan_limit_impression_at": {
+    "description": "AT场景印象语义召回扫描上限(条)",
+    "type": "int",
+    "default": 800,
+    "hint": "仅在 impression_semantic_at_enabled 开启时生效；0 表示扫描全部。"
+  },
+  "semantic_recall_scan_limit_impression_v3_at": {
+    "description": "AT场景 Impression V3 扫描上限(条)",
+    "type": "int",
+    "default": 800,
+    "hint": "仅在 impression_semantic_at_enabled 开启时生效；0 表示扫描全部。"
   },
   "enable_faiss_recall": {
     "description": "启用FAISS语义召回加速",
@@ -190,7 +886,7 @@
   "embedding_openai_base_url": {
     "description": "OpenAI格式嵌入API地址",
     "type": "string",
-    "default": ""
+    "default": "https://api.siliconflow.cn/v1"
   },
   "embedding_openai_api_key": {
     "description": "OpenAI格式嵌入API密钥",
@@ -200,58 +896,7 @@
   "embedding_openai_model": {
     "description": "OpenAI嵌入模型",
     "type": "string",
-    "default": "text-embedding-3-small"
-  },
-  "vision_llm": {
-    "description": "快速图片处理LLM配置",
-    "type": "object",
-    "default": {
-      "enable": false,
-      "provider": "openai",
-      "base_url": "https://api.openai.com/v1",
-      "api_key": "",
-      "model": "gpt-4o-mini",
-      "prompt": "请简要描述这张图片的内容，50字以内。",
-      "format": "openai"
-    },
-    "items": {
-      "enable": {"type": "bool", "description": "启用"},
-      "provider": {"type": "string", "description": "提供商"},
-      "base_url": {"type": "string", "description": "API地址"},
-      "api_key": {"type": "string", "description": "API密钥"},
-      "model": {"type": "string", "description": "模型名称"},
-      "prompt": {"type": "string", "description": "提示词"},
-      "format": {
-        "type": "string",
-        "description": "载荷格式",
-        "options": ["openai", "google"],
-        "labels": ["OpenAI格式", "Google Gemini格式"],
-        "default": "openai"
-      }
-    }
-  },
-  "chat_model_supports_vision": {
-    "description": "聊天模型是否支持识图功能",
-    "type": "bool",
-    "default": false
-  },
-  "vision_image_cache_enable": {
-    "description": "启用群聊重复图片视觉描述缓存（非 @ 消息）",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后会把图片 file/url 归一化后写入本地 SQLite，并复用缓存的 [图片内容: ...]，减少视觉 LLM 调用。"
-  },
-  "vision_image_cache_ttl_days": {
-    "description": "图片视觉描述缓存有效期(天)",
-    "type": "int",
-    "default": 30,
-    "hint": "超过有效期的缓存不会被使用，并会在写入时自动清理。"
-  },
-  "vision_image_cache_max_records": {
-    "description": "图片视觉描述缓存最大记录数(每群)",
-    "type": "int",
-    "default": 20000,
-    "hint": "超过后会按最后出现时间从旧到新裁剪。"
+    "default": "BAAI/bge-m3"
   },
   "debug_log_memory_context": {
     "description": "打印记忆上下文日志",
@@ -274,5 +919,65 @@
     "type": "bool",
     "default": false,
     "hint": "开启后日志可能极长；会自动省略 data:image base64"
+  },
+  "history_as_role_contexts": {
+    "description": "历史对话走 role 消息通道",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后【历史对话】不再以纯文本塞进 system prompt，而是拆成 role=user/assistant 的消息，模型能结构化区分自己说过的话。关闭则回到旧行为。"
+  },
+  "ga_scoring_enabled": {
+    "description": "启用三因子记忆打分",
+    "type": "bool",
+    "default": true,
+    "hint": "按 Generative Agents 的方式把相关性、新近度、重要性加权求和，替代原来的「相似度 × 时间衰减」乘积。只作用于 memory / reflection 两类，关闭即回退旧行为。"
+  },
+  "ga_weight_relevance": {
+    "description": "三因子权重：相关性",
+    "type": "float",
+    "default": 1.0,
+    "hint": "语义相似度的权重。保持最大以贴近原有排序。"
+  },
+  "ga_weight_recency": {
+    "description": "三因子权重：新近度",
+    "type": "float",
+    "default": 0.5,
+    "hint": "时间新鲜度的权重。调高会更偏向最近发生的事。"
+  },
+  "ga_weight_importance": {
+    "description": "三因子权重：重要性",
+    "type": "float",
+    "default": 0.5,
+    "hint": "重要性评分的权重。调高会让「我爸住院了」这类高分记忆更容易被召回。"
+  },
+  "ga_recency_half_life_sec": {
+    "description": "三因子新近度半衰期(秒)",
+    "type": "int",
+    "default": 2592000,
+    "hint": "三因子打分里新近度的半衰期，默认 30 天。注意这与 memory_time_decay_half_life_sec（乘法衰减用，默认 7 天）是两个独立参数：7 天在加权求和里会让一个月前的记忆直接衰到 0.05，重要性就再也翻不过来。"
+  },
+  "ga_importance_default": {
+    "description": "重要性默认值",
+    "type": "float",
+    "default": 0.5,
+    "hint": "写入记忆时若未给出重要性评分，使用该默认值（0~1）。"
+  },
+  "reflection_inject_enabled": {
+    "description": "注入【我的观察】反思块",
+    "type": "bool",
+    "default": true,
+    "hint": "把 scripts/memory_reflect.py 归纳出的结论作为【我的观察】注入提示词，优先级 80（高于相关记忆 70，低于人物印象 90）。"
+  },
+  "max_injected_reflections": {
+    "description": "反思注入条数上限",
+    "type": "int",
+    "default": 5,
+    "hint": "一条反思能顶十条零散记忆，所以这里不需要给大。"
+  },
+  "memory_importance_scoring_enabled": {
+    "description": "让模型给记忆打重要性分",
+    "type": "bool",
+    "default": true,
+    "hint": "在回复的同一次请求里附带输出 memory_importance（1-10），归一化后写入 importance 列，供三因子召回排序使用。不增加额外 LLM 请求；关闭后所有新记忆都用 ga_importance_default。"
   }
 }

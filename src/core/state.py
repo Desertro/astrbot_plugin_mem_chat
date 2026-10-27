@@ -2,6 +2,7 @@ import hashlib
 import random
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from enum import Enum
 
 
@@ -26,6 +27,7 @@ class MemChatState:
         self.last_read_id: dict[str, str] = {}
         self.pending_msgs: dict[str, list[tuple[str, str, str, str, float]]] = {}
         self.last_processed: dict[str, float] = {}
+        self.last_cycle_cutoff: dict[str, float] = {}
         self.bot_self_ids: dict[str, str] = {}
         self.bot_self_names: dict[str, str] = {}
         self.interrupt_flags: dict[str, bool] = {}
@@ -39,6 +41,208 @@ class MemChatState:
         self.heartbeat_start: dict[str, float] = {}
         self.recent_msg_keys: dict[str, dict[str, float]] = {}
         self.focus_delays: dict[str, float] = {}
+        self.last_sent_image_ids: dict[str, list[str]] = {}
+        self.reply_targets: dict[str, dict[str, str]] = {}
+        self.reply_targets_seen_ts: dict[str, dict[str, float]] = {}
+        self.reply_summaries: dict[str, dict[str, tuple[str, str, str, float]]] = {}
+        self.message_metas: dict[str, dict[str, dict]] = {}
+        self.message_meta_seen_ts: dict[str, dict[str, float]] = {}
+        self.last_moods: dict[str, str] = {}
+        self.last_mood_states: dict[str, str] = {}
+        self.mood_state_expires_at: dict[str, float] = {}
+        self.last_mood_intensity: dict[str, float] = {}
+        self.last_affinity_deltas: dict[str, dict[str, tuple[float, str, float]]] = {}
+        self.poke_preapply_msg_ids: dict[str, dict[str, float]] = {}
+        self.no_reply_msg_ids: dict[str, dict[str, float]] = {}
+
+    def get_last_mood(self, umo: str) -> str:
+        if not umo:
+            return ""
+        v = self.last_moods.get(umo)
+        return str(v or "").strip()
+
+    def set_last_mood(self, umo: str, mood_text: str | None):
+        if not umo:
+            return
+        s = str(mood_text or "").strip()
+        if not s:
+            return
+        self.last_moods[umo] = s[:60]
+
+    def get_last_mood_state(self, umo: str) -> str:
+        if not umo:
+            return ""
+        exp = float(self.mood_state_expires_at.get(umo, 0.0) or 0.0)
+        if exp > 0 and self._now() >= exp:
+            self.last_mood_states[umo] = "中性"
+            self.mood_state_expires_at.pop(umo, None)
+        v = self.last_mood_states.get(umo)
+        return str(v or "").strip()
+
+    def set_last_mood_state(self, umo: str, mood_state: str | None):
+        if not umo:
+            return
+        s = str(mood_state or "").strip()
+        if not s:
+            return
+        self.last_mood_states[umo] = s[:40]
+        if s[:40] == "中性":
+            self.mood_state_expires_at.pop(umo, None)
+
+    def clear_last_mood_state(self, umo: str):
+        if not umo:
+            return
+        self.last_mood_states.pop(umo, None)
+        self.mood_state_expires_at.pop(umo, None)
+
+    def set_mood_state_ttl(self, umo: str, ttl_sec: int | float | None):
+        if not umo:
+            return
+        try:
+            ttl = float(ttl_sec or 0.0)
+        except Exception:
+            ttl = 0.0
+        if ttl <= 0:
+            self.mood_state_expires_at.pop(umo, None)
+            return
+        self.mood_state_expires_at[umo] = self._now() + ttl
+
+    def get_mood_state_ttl_remaining(self, umo: str) -> float:
+        if not umo:
+            return 0.0
+        exp = float(self.mood_state_expires_at.get(umo, 0.0) or 0.0)
+        if exp <= 0:
+            return 0.0
+        remain = exp - self._now()
+        if remain <= 0:
+            self.mood_state_expires_at.pop(umo, None)
+            self.last_mood_states[umo] = "中性"
+            return 0.0
+        return remain
+
+    def set_last_mood_intensity(self, umo: str, intensity: float | int | None):
+        if not umo:
+            return
+        try:
+            v = float(intensity if intensity is not None else 0.0)
+        except Exception:
+            v = 0.0
+        if v < 0.0:
+            v = 0.0
+        if v > 1.0:
+            v = 1.0
+        self.last_mood_intensity[umo] = v
+
+    def get_last_mood_intensity(self, umo: str) -> float:
+        if not umo:
+            return 0.0
+        try:
+            return float(self.last_mood_intensity.get(umo, 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    def clear_last_mood(self, umo: str):
+        if not umo:
+            return
+        self.last_moods.pop(umo, None)
+        self.last_mood_intensity.pop(umo, None)
+
+    def set_last_affinity_delta(
+        self, umo: str, user_id: str, delta: float | int | None, reason: str | None = ""
+    ):
+        if not umo:
+            return
+        uid = str(user_id or "").strip()
+        if not uid:
+            return
+        try:
+            d = float(delta if delta is not None else 0.0)
+        except Exception:
+            d = 0.0
+        if d > 40.0:
+            d = 40.0
+        elif d < -40.0:
+            d = -40.0
+        bucket = self.last_affinity_deltas.get(umo)
+        if bucket is None:
+            bucket = {}
+            self.last_affinity_deltas[umo] = bucket
+        bucket[uid] = (d, str(reason or "")[:160], self._now())
+
+    def pop_last_affinity_delta(
+        self, umo: str, user_id: str, max_age_sec: float = 600.0
+    ) -> tuple[float, str] | None:
+        if not umo:
+            return None
+        uid = str(user_id or "").strip()
+        if not uid:
+            return None
+        bucket = self.last_affinity_deltas.get(umo)
+        if not bucket:
+            return None
+        rec = bucket.pop(uid, None)
+        if rec is None:
+            return None
+        try:
+            delta, reason, ts = rec
+            age = self._now() - float(ts or 0.0)
+        except Exception:
+            return None
+        if max_age_sec > 0 and age > float(max_age_sec):
+            return None
+        return float(delta), str(reason or "")
+
+    def mark_poke_preapplied_msg(
+        self,
+        umo: str,
+        msg_id: str,
+        *,
+        ttl_sec: float = 7200,
+        max_size: int = 2048,
+    ):
+        if not umo:
+            return
+        mid = str(msg_id or "").strip()
+        if not mid:
+            return
+        now = self._now()
+        bucket = self.poke_preapply_msg_ids.get(umo)
+        if bucket is None:
+            bucket = {}
+            self.poke_preapply_msg_ids[umo] = bucket
+        if len(bucket) >= max_size:
+            expired = [k for k, ts in bucket.items() if now - ts > ttl_sec]
+            for k in expired:
+                bucket.pop(k, None)
+            if len(bucket) >= max_size:
+                oldest = sorted(bucket.items(), key=lambda kv: kv[1])[: max(1, max_size // 8)]
+                for k, _ in oldest:
+                    bucket.pop(k, None)
+        bucket[mid] = now
+
+    def is_poke_preapplied_msg(
+        self,
+        umo: str,
+        msg_id: str,
+        *,
+        ttl_sec: float = 7200,
+    ) -> bool:
+        if not umo:
+            return False
+        mid = str(msg_id or "").strip()
+        if not mid:
+            return False
+        bucket = self.poke_preapply_msg_ids.get(umo)
+        if not bucket:
+            return False
+        now = self._now()
+        ts = bucket.get(mid)
+        if ts is None:
+            return False
+        if ttl_sec > 0 and now - ts > ttl_sec:
+            bucket.pop(mid, None)
+            return False
+        return True
 
     def is_duplicate_incoming(
         self,
@@ -195,6 +399,14 @@ class MemChatState:
     def get_last_processed(self, umo: str) -> float:
         return self.last_processed.get(umo, 0.0)
 
+    def set_last_cycle_cutoff(self, umo: str, timestamp: float):
+        if not umo:
+            return
+        self.last_cycle_cutoff[umo] = float(timestamp or 0.0)
+
+    def get_last_cycle_cutoff(self, umo: str) -> float:
+        return float(self.last_cycle_cutoff.get(umo, 0.0) or 0.0)
+
     def set_focus(self, umo: str, duration_sec: int):
         now = self._now()
         t = now + max(1, int(duration_sec))
@@ -222,6 +434,15 @@ class MemChatState:
     def get_focus_start(self, umo: str) -> float:
         return self.focus_start.get(umo, 0.0)
 
+    def get_focus_remaining_sec(self, umo: str) -> float:
+        t = self.focus_until.get(umo)
+        if not t:
+            return 0.0
+        remain = float(t) - self._now()
+        if remain < 0:
+            return 0.0
+        return remain
+
     def get_focus_delay(self, umo: str, default: float = 15.0) -> float:
         return self.focus_delays.get(umo, default)
 
@@ -246,6 +467,165 @@ class MemChatState:
         if umo:
             self.focus_delays[umo] = default
 
+    def set_reply_target(self, umo: str, msg_id: str | None, reply_msg_id: str | None):
+        if not umo or not msg_id or not reply_msg_id:
+            return
+        d = self.reply_targets.get(umo)
+        if d is None:
+            d = {}
+            self.reply_targets[umo] = d
+        d[str(msg_id)] = str(reply_msg_id)
+        ts_map = self.reply_targets_seen_ts.get(umo)
+        if ts_map is None:
+            ts_map = {}
+            self.reply_targets_seen_ts[umo] = ts_map
+        ts_map[str(msg_id)] = self._now()
+        self.cleanup_reply_data(umo)
+
+    def get_reply_target(self, umo: str, msg_id: str | None) -> str | None:
+        if not umo or not msg_id:
+            return None
+        d = self.reply_targets.get(umo)
+        if not d:
+            return None
+        return d.get(str(msg_id))
+
+    def set_reply_summary(
+        self,
+        umo: str,
+        reply_msg_id: str | None,
+        sender_id: str | None,
+        sender_name: str | None,
+        text: str | None,
+    ):
+        if not umo or not reply_msg_id:
+            return
+        d = self.reply_summaries.get(umo)
+        if d is None:
+            d = {}
+            self.reply_summaries[umo] = d
+        d[str(reply_msg_id)] = (
+            str(sender_id or ""),
+            str(sender_name or ""),
+            str(text or ""),
+            self._now(),
+        )
+        self.cleanup_reply_data(umo)
+
+    def get_reply_summary(
+        self, umo: str, reply_msg_id: str | None
+    ) -> tuple[str, str, str, float] | None:
+        if not umo or not reply_msg_id:
+            return None
+        d = self.reply_summaries.get(umo)
+        if not d:
+            return None
+        return d.get(str(reply_msg_id))
+
+    def cleanup_reply_data(
+        self,
+        umo: str,
+        *,
+        reply_targets_ttl_sec: float = 7 * 24 * 3600,
+        reply_targets_max_size: int = 4096,
+        reply_summaries_ttl_sec: float = 7 * 24 * 3600,
+        reply_summaries_max_size: int = 4096,
+    ):
+        if not umo:
+            return
+        now = self._now()
+
+        t_map = self.reply_targets_seen_ts.get(umo)
+        d = self.reply_targets.get(umo)
+        if t_map and d:
+            if reply_targets_ttl_sec > 0:
+                expired = [
+                    k
+                    for k, ts in t_map.items()
+                    if ts is not None and now - float(ts or 0.0) > reply_targets_ttl_sec
+                ]
+                for k in expired:
+                    t_map.pop(k, None)
+                    d.pop(k, None)
+            if reply_targets_max_size > 0 and len(t_map) > reply_targets_max_size:
+                items = sorted(t_map.items(), key=lambda kv: float(kv[1] or 0.0))
+                for k, _ in items[: max(0, len(items) - reply_targets_max_size)]:
+                    t_map.pop(k, None)
+                    d.pop(k, None)
+
+        s_map = self.reply_summaries.get(umo)
+        if s_map:
+            if reply_summaries_ttl_sec > 0:
+                expired = [
+                    k
+                    for k, v in s_map.items()
+                    if v is not None and now - float(v[3] or 0.0) > reply_summaries_ttl_sec
+                ]
+                for k in expired:
+                    s_map.pop(k, None)
+            if reply_summaries_max_size > 0 and len(s_map) > reply_summaries_max_size:
+                items = sorted(s_map.items(), key=lambda kv: float(kv[1][3] or 0.0))
+                for k, _ in items[: max(0, len(items) - reply_summaries_max_size)]:
+                    s_map.pop(k, None)
+
+    def set_message_meta(self, umo: str, msg_id: str | None, meta: dict | None):
+        if not umo or not msg_id or not isinstance(meta, dict):
+            return
+        mid = str(msg_id).strip()
+        if not mid:
+            return
+        d = self.message_metas.get(umo)
+        if d is None:
+            d = {}
+            self.message_metas[umo] = d
+        ts_map = self.message_meta_seen_ts.get(umo)
+        if ts_map is None:
+            ts_map = {}
+            self.message_meta_seen_ts[umo] = ts_map
+        d[mid] = deepcopy(meta)
+        ts_map[mid] = self._now()
+        self.cleanup_message_meta(umo)
+
+    def get_message_meta(self, umo: str, msg_id: str | None) -> dict | None:
+        if not umo or not msg_id:
+            return None
+        d = self.message_metas.get(umo)
+        if not d:
+            return None
+        meta = d.get(str(msg_id).strip())
+        if not isinstance(meta, dict):
+            return None
+        return deepcopy(meta)
+
+    def cleanup_message_meta(
+        self,
+        umo: str,
+        *,
+        ttl_sec: float = 7 * 24 * 3600,
+        max_size: int = 4096,
+    ):
+        if not umo:
+            return
+        d = self.message_metas.get(umo)
+        ts_map = self.message_meta_seen_ts.get(umo)
+        if not d or not ts_map:
+            return
+        now = self._now()
+        if ttl_sec > 0:
+            expired = [
+                k
+                for k, ts in ts_map.items()
+                if ts is not None and now - float(ts or 0.0) > ttl_sec
+            ]
+            for k in expired:
+                ts_map.pop(k, None)
+                d.pop(k, None)
+        if max_size > 0 and len(ts_map) > max_size:
+            items = sorted(ts_map.items(), key=lambda kv: float(kv[1] or 0.0))
+            for k, _ in items[: max(0, len(items) - max_size)]:
+                ts_map.pop(k, None)
+                d.pop(k, None)
+
     def set_heartbeat_start(self, umo: str):
         if umo:
             self.heartbeat_start[umo] = self._now()
@@ -264,6 +644,59 @@ class MemChatState:
         self.last_read_id.clear()
         self.pending_msgs.clear()
         self.recent_msg_keys.clear()
+        self.reply_targets.clear()
+        self.reply_targets_seen_ts.clear()
+        self.reply_summaries.clear()
+        self.message_metas.clear()
+        self.message_meta_seen_ts.clear()
+        self.last_moods.clear()
+        self.last_mood_states.clear()
+        self.last_mood_intensity.clear()
+        self.mood_state_expires_at.clear()
+        self.last_affinity_deltas.clear()
+        self.poke_preapply_msg_ids.clear()
+        self.no_reply_msg_ids.clear()
+
+    def mark_no_reply_message_ids(
+        self,
+        umo: str,
+        msg_ids: list[str] | None,
+        *,
+        ttl_sec: float = 24 * 3600,
+        max_size: int = 1024,
+    ):
+        if not umo or not msg_ids:
+            return
+        now = self._now()
+        bucket = self.no_reply_msg_ids.get(umo)
+        if bucket is None:
+            bucket = {}
+            self.no_reply_msg_ids[umo] = bucket
+
+        for mid in msg_ids:
+            s = str(mid or "").strip()
+            if not s:
+                continue
+            bucket[s] = now
+
+        if ttl_sec > 0 and bucket:
+            expired = [k for k, ts in bucket.items() if now - float(ts or 0.0) > ttl_sec]
+            for k in expired:
+                bucket.pop(k, None)
+
+        if max_size > 0 and len(bucket) > max_size:
+            items = sorted(bucket.items(), key=lambda kv: float(kv[1] or 0.0))
+            for k, _ in items[: max(0, len(bucket) - max_size)]:
+                bucket.pop(k, None)
+
+    def is_no_reply_message_id(self, umo: str, msg_id: str | None) -> bool:
+        if not umo or msg_id is None:
+            return False
+        s = str(msg_id).strip()
+        if not s:
+            return False
+        bucket = self.no_reply_msg_ids.get(umo) or {}
+        return s in bucket
 
     def update_last_message(
         self,

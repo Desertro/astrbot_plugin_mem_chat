@@ -49,6 +49,13 @@ class TtsService:
         s = re.sub(r"\s+", " ", s).strip()
         return s
 
+    def strip_inline_at_tokens(self, text: str) -> str:
+        """移除内联艾特占位符，避免 TTS 分支被占位符干扰。"""
+        s = str(text or "")
+        s = re.sub(r"<at:\w+>", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
     def split_text(self, text: str, max_chars: int = 120) -> list[str]:
         s = (text or "").strip()
         if not s:
@@ -156,7 +163,7 @@ class TtsService:
                 if tok in ("光啊", "よ光"):
                     parts.append(("text", "よ光"))
                 else:
-                    parts.append(("text", "邦吧咔邦"))
+                    parts.append(("text", "邦邦卡邦"))
             last = m.end()
         if last < len(s):
             parts.append(("text", s[last:]))
@@ -231,3 +238,68 @@ class TtsService:
             return None
 
         return None
+
+    def ensure_min_wav_duration(self, wav_path: str, min_seconds: float = 1.2) -> str:
+        """保证 wav 最小时长，优先在前面拼接“邦邦卡邦”替换音频。"""
+        try:
+            src = str(wav_path or "").strip()
+            if not src or not os.path.exists(src) or not src.lower().endswith(".wav"):
+                return wav_path
+            if min_seconds <= 0:
+                return wav_path
+
+            def _wav_duration(path: str) -> float:
+                try:
+                    with wave.open(path, "rb") as wf:
+                        fr = wf.getframerate()
+                        if fr <= 0:
+                            return 0.0
+                        return wf.getnframes() / float(fr)
+                except Exception:
+                    return 0.0
+
+            duration = _wav_duration(src)
+            if duration >= float(min_seconds):
+                return wav_path
+
+            # 优先在开头拼接“邦邦卡邦”替换音频，让短句语音更自然可感知
+            bong_audio = self.get_replacement_audio_path("邦邦卡邦")
+            if bong_audio and os.path.exists(bong_audio):
+                combined = self.try_concat_wavs([bong_audio, src])
+                if combined and os.path.exists(combined):
+                    if _wav_duration(combined) >= float(min_seconds):
+                        return combined
+                    src = combined
+
+            # 兜底：若仍不足最小时长，则补静音防止平台显示 0s
+            with wave.open(src, "rb") as wf:
+                params = wf.getparams()
+                nframes = wf.getnframes()
+                framerate = params.framerate
+                if framerate <= 0:
+                    return src
+                duration = nframes / float(framerate)
+                if duration >= float(min_seconds):
+                    return src
+                target_frames = int(float(min_seconds) * framerate)
+                need_frames = max(0, target_frames - nframes)
+                if need_frames <= 0:
+                    return src
+                raw = wf.readframes(nframes)
+
+            silence = b"\x00" * need_frames * params.sampwidth * params.nchannels
+            out_dir = os.path.join(self._get_data_path(), "temp")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(
+                out_dir,
+                f"memchat_tts_minlen_{uuid.uuid4().hex}.wav",
+            )
+            with wave.open(out_path, "wb") as out_wf:
+                out_wf.setparams(params)
+                out_wf.writeframes(raw)
+                out_wf.writeframes(silence)
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                return out_path
+            return wav_path
+        except Exception:
+            return wav_path

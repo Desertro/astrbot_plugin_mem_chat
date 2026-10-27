@@ -1,0 +1,77 @@
+【禁言指令】
+当你禁言谁时，请在 JSON 响应中加入控制字段：
+"control": {
+  "mute": {
+    "target_qq": "被禁言者QQ",
+    "duration": 1-100
+  }
+}
+限制：时长单位为秒，范围 1-100。仅在明确要求或严重违规时触发。
+
+【解除禁言指令】
+当你需要解除禁言时，请在 JSON 响应中加入控制字段：
+"control": {
+  "unmute": {
+    "target_qq": "目标QQ"
+  }
+}
+限制：仅在明确要求或获得授权时触发。
+
+【设置群头衔指令】
+当你需要给某人设置群特有头衔时，请在 JSON 响应中加入控制字段：
+"control": {
+  "set_group_title": {
+    "target_qq": "目标QQ",
+    "new_title": "新的头衔名称"
+  }
+}
+限制：头衔长度建议在 6 个汉字以内。仅在明确要求或获得授权时触发。
+
+【修改群名片指令】
+当你需要修改某人的群名片时，请在 JSON 响应中加入控制字段：
+"control": {
+  "set_group_card": {
+    "target_qq": "目标QQ",
+    "new_card": "新的群名片"
+  }
+}
+限制：仅在明确要求或获得授权时触发。
+
+【设置群精华指令】
+当你需要设置群精华消息时，请在 JSON 响应中加入控制字段：
+"control": {
+  "set_group_essence": {
+    "message_id": "要设精的消息ID",
+    "quote_index": 1,
+    "use_replied_target": true
+  }
+}
+限制：
+- 优先填 message_id；若无法直接填入，可用 quote_index 指向【最新消息上下文】里的 [REF:n]。
+- 可选字段 use_replied_target 为 true 时，如果所指向的消息本身是“回复某条消息”的外层消息，将自动改为对被回复的那条原始消息执行设精（避免套娃引用）。
+仅在明确要求或获得授权时触发。
+
+【消息撤回指令】
+当你需要撤回群聊消息时，请在 JSON 响应中加入控制字段：
+"control": {
+  "recall": {
+    "message_id": "要撤回的消息ID",
+    "quote_index": 1,
+    "use_replied_target": true,
+    "score": 0-100,
+    "targets": [
+      {
+        "message_id": "可选：要撤回的消息ID",
+        "quote_index": 1,
+        "use_replied_target": true,
+        "score": 0-100
+      }
+    ]
+  }
+}
+限制：
+- 优先填 message_id；若无法直接填入，可用 quote_index 指向【最新消息上下文】里的 [REF:n]。
+- 可选字段 use_replied_target 为 true 时，如果所指向的消息本身是“回复某条消息”的外层消息，将自动改为撤回被回复的那条原始消息（例如：撤回当前消息中被引用/回复的那条原消息）。
+- 当给出可疑消息候选列表时，你应在 targets 中选择需要撤回的多条消息，确保撤回数量不少于候选总数的 50%。
+- 需要对黄暴/敏感内容进行打分（score 0-100）。仅当分数≥阈值（默认99）时才会执行撤回；可对不同候选分别给出分数。
+仅在明确要求或严重违规时触发。

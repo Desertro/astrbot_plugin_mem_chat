@@ -11,6 +11,9 @@ from astrbot.core.platform.platform_metadata import PlatformMetadata
 class DummyEvent(AstrMessageEvent):
     def __init__(self, u, ctx):
         self.context = ctx
+        # Optional runtime handles (can be injected by scheduler) for control actions.
+        self.bot = None
+        self.adapter = None
         platform_id = "dummy"
         message_type = MessageType.OTHER_MESSAGE
         session_id = u
