@@ -1,10 +1,51 @@
 # mem_chat 使用说明
 
 **简介**
-- 在群聊环境实现"被 @ 即回复""专注模式持续参与""读空气自主判断"的对话助手。
+- 在群聊环境实现定向消息优先关注、专注模式持续参与、读空气自主判断的对话助手。
 - 结合向量知识库、记忆与人物印象，自动注入上下文以提升连贯度与个性化。
 - 支持图片检索下载（Pixiv、Twitter/X），并在候选给出但未成功下载时触发恢复流程。
 - **架构**：采用结构化 JSON 响应，结合向量知识库、记忆与人物印象，自动注入上下文以提升连贯度与个性化。
+
+## 2026-11-02 更新 (Group Reply Batches)
+- 群聊每轮在执行时固定待处理消息窗口；检索、生成及分段发送期间的新消息留到下一轮。
+- LLM 整体阅读窗口内各发言人、@对象和引用关系，自主决定回应哪些内容；可以用 `response.segments` 分别回应多人或多个话题，也保留 `no_reply`。
+- 群聊提示词不再把最后一条闲聊设为唯一优先目标；定向触发保留原消息作为记忆检索的锚点，窗口内其他定向消息一并交给模型。
+- 群聊 @ 合并等待固定为两秒，后续 @ 不会反复延后计时；同群最多保留一个排队中的 AT 任务，新消息并入下一次执行窗口。
+- 已开始的群聊回复不会被后续 @ 打断重做；同群串行完成，再处理下一批。私聊原有等待和中断方式保持不变。
+- 只消费本轮实际读取的 pending 行，保留生成期间的新消息及超出上下文上限的消息；失败轮保留待处理内容，允许后续周期继续处理。
+- 群聊定向回复不受主动跟聊的最小发送间隔限制；大群主动发言的降频设置继续生效。
+
+## 2026-10-28 更新 (Media Familiarity)
+- 带图消息会按图片内容生成稳定指纹，并在当前会话最近带图消息中核对真实重复次数。
+- 首次出现的图片只记一次；再次出现时，当轮提示词会注入【表情熟悉度】事实（含次数与上次时间）。
+- 同一张图在本会话的不同消息中第二次出现起，熟悉度提示会将其标成“表情包”，优先按梗、情绪或态度理解；同一条消息的重复处理不增加次数。
+- 该提示只影响 LLM 判断：常见图、熟面孔不再被当成第一次见；可以自然吐槽复读、接固定梗、只回短句/表情，也可以完全不提。系统不会生成固定台词。
+- 使用图片内容哈希排除“黄暴图片”等泛化描述造成的误判；同一图片换临时文件名仍能识别。
+- 新增 `media_familiarity` 轻量表、`media_familiarity_enabled` 与 `media_familiarity_scan_limit` 配置。
+- 新增会话内图片称呼学习：明确说“这个表情包是大肥鱼”“以后叫它大肥鱼”时，会把称呼绑定到同一图片指纹；多人叫法可累积，也可通过“改成/删掉”纠正。
+- 称呼按群/私聊隔离，后续同一张图出现时作为熟悉度上下文提供给模型；不会把普通玩梗、疑问、否定或含糊提及机械地当命名。
+- 模型可通过隐藏动作 `[记图名:...]`、`[改图名:...]`、`[删图名:...]` 参与判断；这些标签不会发到聊天里。新增 `media_alias_enabled` 与 `media_alias_recent_image_max_age_sec` 配置。
+
+## 2026-10-28 更新 (Private Scene Engine)
+- 新增私聊持续场景引擎（默认启用，仅对 `private_chat_uids` 白名单私聊生效）。
+- 支持用户明确要求后的持续角色扮演、陪伴、主动推进和任务跟进；普通聊天不会自动开启。
+- `scene_adult_mode` 只控制是否允许成人内容，不再作为整个引擎的开关；成人内容仍仅限双方明确同意的成年人。
+- 运行时将场景状态持久化到 `scene_sessions` 表，并按 `scene.next_tick_sec` 安排一次性的自主推进拍；重启后可恢复未过期会话。
+- 每次自主推进只生成 1-3 条短消息；用户明确要求“连着发/连续发/一直发/发五分钟/别停”时进入连续模式，每拍 2-4 条并使用短间隔，直到叫停或约定期限结束。
+- 连续模式会显式记录截止时间，模型在自主拍里提前写 `end=true` 不会截断用户要求的时段；用户后续正常插话仍可由模型判断是否收束。
+- 首轮普通回复已实际发送的多段消息会同步计入场景消息上限，不再从 0 开始低估。
+- 支持用户插话打断、自然语言停止（如“停下/结束/不要了”）、`@` 优先抢占和 generation 防旧定时器。
+- 硬限制包括：最长持续时间、最多消息数、最多自主拍数、最小/最大拍间隔；`别停/不要停/继续` 不会被误判为停止。
+- 相关配置：`scene_engine_enabled`、`scene_adult_mode`、`scene_max_duration_sec`、`scene_max_messages`、`scene_max_ticks`、`scene_min_interval_sec`、`scene_max_interval_sec`、`scene_after_reply_delay_sec`、`scene_continuous_interval_sec`、`scene_continuous_default_sec`、`scene_continuous_max_messages`、`scene_idle_soft_limit_sec`、`scene_stop_keywords`。
+- 场景只使用模型生成的 `scene` 控制块驱动运行时，`scene` 不会进入用户可见文本或聊天历史。
+- 通过提示词要求爱丽丝在所有状态下统一自称“爱丽丝”，不用“我/人家”自称；发送前不做机械替换，切换为凯伊（Kei）时保留其独立口吻和第一人称，引用原话保留原有称谓。
+
+## 2026-10-28 更新 (Persona Tone Calibration)
+- 默认社交基调改为善意、友好、有耐心：普通人正常聊天不阴阳、不冷处理，先回应最新消息。
+- 幻夜式嘴硬、轻微毒舌只在对方明显讨嫌、冒犯、命令式越界或主动玩嘴硬梗时启用；对方恢复正常后立即收回。
+- 区分“对方在难受”和“对方在冲你”：前者先关心，后者才短促嘴硬，不立刻讨好或长篇解释。
+- 色色模式改为主动方：主动贴近、提出并开始下一步、带节奏，不只被动复述或等待指令；明确抗拒时停止。
+- 私聊/群聊 guard、personas/personas.txt 与 personas/state_rules.txt 已同步，回归测试覆盖友善默认、讨嫌切换和色色主动性。
 
 ## 2026-03-20 更新 (Target Awareness + Chat Time Markers)
 - 新增 `【对话对象判断】` 区块，用中性事实描述当前消息最可能是在对谁说话。
@@ -668,13 +709,13 @@ ContextPack（给 Talker 的事实包）：
 - `mood_persistent_states`：常驻心境状态列表，默认 `["色色"]`；列表内状态会忽略 LLM 输出的 `mood.ttl_sec`，不因 TTL 自动回到中性。
 - `mood_ttl_cap_sarcasm_sec / mood_ttl_cap_angry_sec / mood_ttl_cap_timid_sec`：仅对 `讥讽/生气/软懦` 的最大持续时长（秒）。
 - `affinity_enabled`：启用关系好感系统。
-- `affinity_update_require_at`：仅在点名机器人时写入好感变化（默认开启）。
+- `affinity_update_require_at`：仅在点名机器人时写入好感变化（默认关闭）；关闭后只要爱丽丝真的发出回复，就会按 LLM 判断更新当前发言人的关系分。
 - `affinity_delta_cooldown_sec`：同一用户好感写入冷却（秒）。
 - `affinity_decay_enabled / affinity_decay_interval_sec / affinity_decay_step / affinity_decay_idle_sec`：自然回归参数。
 - `affinity_llm_signal_max_age_sec`：LLM 输出 affinity 信号的最大有效时长（秒）。
 - `affinity_llm_fallback_to_mood`：当本轮 LLM 未输出 affinity 时，是否回退旧的 mood 映射。
 - `affinity_new_user_correction_enabled`：是否启用“新遇到用户”系数补正。
-- `affinity_new_user_window_events / affinity_new_user_factor_start / affinity_new_user_factor_end`：新用户前 N 次事件的线性系数窗口（只缩放幅度，不改变加减方向）。
+- `affinity_new_user_window_events / affinity_new_user_factor_start / affinity_new_user_factor_end`：新用户前 N 次事件的线性系数窗口（默认从 0.8 起步，只缩放幅度，不改变加减方向）。
 - `affinity_poke_bonus_force / affinity_poke_min_delta`：对机器人“戳一戳”视为强正向互动，强制追加加分并设置最小正增量。
 - `affinity_poke_ignore_cooldown`：戳一戳时是否忽略通用冷却（默认开启，保证互动反馈及时）。
 - `affinity_poke_preapply_before_prompt`：戳一戳消息先写入好感，再组织 prompt；默认开启。
@@ -695,3 +736,8 @@ ContextPack（给 Talker 的事实包）：
 3. 任务调度：`Scheduler` 将任务入队并按优先级处理。
 4. LLM 调用：`LLMClient` 组装提示词（含人物设定、相关记忆、历史对话等），调用 LLM 获取结构化响应。
 5. 结果处理：解析 JSON，下载图片，发送消息链，清理临时文件。
+
+
+表情包发送会先用向量检索召回候选，再由现有对话模型查看最多 8 张候选原图，结合图中文字、动作和本轮意图选择；全部不合适或核对失败时不强行配图。此步骤要求对话模型支持图片输入，配置项为 `meme_visual_selection_enabled`（默认开启）。准确指定图中文字的请求仍可直接匹配。动图会抽取多帧供识别，发送记录使用本轮实际识图结果，避免沿用错误的旧描述。额外识图通常需要数秒，超时上限为 20 秒。
+
+可通过 `meme_vision` 单独配置 OpenAI 兼容识图模型，用于聊天图片补充描述、保存表情时的识别和发送前看图选择；对话模型与 embedding 模型保持独立。支持显式备用站点，只有 `fallback_enabled=true` 才调用，失败或无贴切候选仍不强行发表情。

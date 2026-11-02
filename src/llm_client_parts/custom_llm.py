@@ -246,7 +246,10 @@ async def call_custom_llm(
         pass
     try:
         async with aiohttp.ClientSession(trust_env=True) as session:
-            max_attempts = 2 if json_mode else 1
+            # DeepSeek Flash occasionally returns a blank completion even
+            # though JSON mode is enabled. Two attempts still fail often
+            # enough to be noticeable in live chat, so allow one more retry.
+            max_attempts = 3 if json_mode else 1
             for attempt in range(max_attempts):
                 if attempt > 0:
                     retry_messages = copy.deepcopy(messages)
@@ -284,16 +287,23 @@ async def call_custom_llm(
                                 if tc.get("function", {}).get("name")
                             ]
 
-                        if (
-                            json_mode
-                            and not (content or "").strip()
-                            and not tool_calls
-                            and attempt + 1 < max_attempts
-                        ):
-                            logger.warning(
-                                "[mem_chat] Custom LLM returned empty JSON content; retrying once with stricter JSON prompt."
+                        if json_mode and not (content or "").strip() and not tool_calls:
+                            finish_reason = str(
+                                choice.get("finish_reason") or "unknown"
                             )
-                            continue
+                            if attempt + 1 < max_attempts:
+                                logger.warning(
+                                    "[mem_chat] Custom LLM returned empty JSON content "
+                                    f"(attempt {attempt + 1}/{max_attempts}, "
+                                    f"finish_reason={finish_reason}); retrying with stricter JSON prompt."
+                                )
+                                continue
+                            logger.warning(
+                                "[mem_chat] Custom LLM returned empty JSON content "
+                                f"after {max_attempts} attempts "
+                                f"(finish_reason={finish_reason}); treating as invocation failure."
+                            )
+                            return None
 
                         if tool_calls:
                             try:

@@ -52,3 +52,7 @@ logs/
 *.pem
 *.key
 *.bak_*
+
+# Local audit outputs and affinity backups
+media_caption_backfill_*.json
+mem_chat_affinity_backup_*.json

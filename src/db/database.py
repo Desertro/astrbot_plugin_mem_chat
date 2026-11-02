@@ -321,6 +321,55 @@ class DatabaseManager:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS scene_sessions (
+                umo TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                state_json TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scene_sessions_status ON scene_sessions(status, updated_at)"
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media_familiarity (
+                scope_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                caption TEXT,
+                seen_count INTEGER NOT NULL DEFAULT 1,
+                first_seen_at REAL NOT NULL,
+                last_seen_at REAL NOT NULL,
+                last_message_id TEXT,
+                last_sender_name TEXT,
+                PRIMARY KEY(scope_id, fingerprint)
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_media_familiarity_scope_seen ON media_familiarity(scope_id, last_seen_at DESC)"
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media_aliases (
+                scope_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                source_sender_id TEXT,
+                source_sender_name TEXT,
+                source_message_id TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(scope_id, fingerprint, alias)
+            )
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_media_aliases_lookup ON media_aliases(scope_id, fingerprint, updated_at DESC)"
+        )
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS image_library (
                 image_id TEXT PRIMARY KEY,
                 url TEXT,
@@ -516,6 +565,114 @@ class DatabaseManager:
         cur.execute("DELETE FROM system_meta WHERE key = ?", (key,))
         self._db_conn.commit()
         cur.close()
+
+    # ------------------------------------------------------------------
+    # Persistent private-chat scene sessions
+    # ------------------------------------------------------------------
+    async def save_scene_session(self, session: dict) -> bool:
+        """Insert or replace one scene session state."""
+        if not isinstance(session, dict) or not session.get("umo"):
+            return False
+        if not self._db_conn:
+            self.init_db_conn()
+        try:
+            payload = json.dumps(session, ensure_ascii=False)
+            status = str(session.get("status") or "active")
+            updated_at = float(session.get("updated_at") or time.time())
+            async with self._db_write_lock:
+                await asyncio.to_thread(
+                    self._save_scene_session_sync,
+                    str(session["umo"]),
+                    status,
+                    updated_at,
+                    payload,
+                )
+            return True
+        except Exception as e:
+            logger.warning(f"[mem_chat] save_scene_session failed: {e}")
+            return False
+
+    def _save_scene_session_sync(
+        self, umo: str, status: str, updated_at: float, payload: str
+    ):
+        cur = self._db_conn.cursor()
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO scene_sessions(umo, status, updated_at, state_json)
+            VALUES(?, ?, ?, ?)
+            """,
+            (umo, status, updated_at, payload),
+        )
+        self._db_conn.commit()
+        cur.close()
+
+    async def get_scene_session(self, umo: str) -> dict | None:
+        if not umo:
+            return None
+        if not self._db_conn:
+            self.init_db_conn()
+        try:
+            return await asyncio.to_thread(self._get_scene_session_sync, str(umo))
+        except Exception as e:
+            logger.warning(f"[mem_chat] get_scene_session failed: {e}")
+            return None
+
+    def _get_scene_session_sync(self, umo: str) -> dict | None:
+        cur = self._db_conn.cursor()
+        cur.execute(
+            "SELECT status, updated_at, state_json FROM scene_sessions WHERE umo = ?",
+            (umo,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        try:
+            data = json.loads(row[2] or "{}")
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data["umo"] = umo
+        data["status"] = str(row[0] or data.get("status") or "active")
+        data["updated_at"] = float(row[1] or data.get("updated_at") or 0)
+        return data
+
+    async def list_scene_sessions(self, status: str = "") -> list[dict]:
+        if not self._db_conn:
+            self.init_db_conn()
+        try:
+            return await asyncio.to_thread(self._list_scene_sessions_sync, status)
+        except Exception as e:
+            logger.warning(f"[mem_chat] list_scene_sessions failed: {e}")
+            return []
+
+    def _list_scene_sessions_sync(self, status: str = "") -> list[dict]:
+        cur = self._db_conn.cursor()
+        if status:
+            cur.execute(
+                "SELECT umo, status, updated_at, state_json FROM scene_sessions WHERE status = ? ORDER BY updated_at DESC",
+                (str(status),),
+            )
+        else:
+            cur.execute(
+                "SELECT umo, status, updated_at, state_json FROM scene_sessions ORDER BY updated_at DESC"
+            )
+        rows = cur.fetchall()
+        cur.close()
+        out = []
+        for umo, row_status, updated_at, raw in rows:
+            try:
+                data = json.loads(raw or "{}")
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            data["umo"] = str(umo or data.get("umo") or "")
+            data["status"] = str(row_status or data.get("status") or "")
+            data["updated_at"] = float(updated_at or data.get("updated_at") or 0)
+            out.append(data)
+        return out
 
     async def add_image_to_library(
         self,
@@ -3150,6 +3307,548 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"[mem_chat] Failed to get recent raw group messages: {e}")
             return []
+
+    async def get_recent_media_messages(
+        self,
+        group_id: str,
+        limit: int = 1200,
+        exclude_message_id: str | None = None,
+    ) -> list[dict]:
+        """Read a bounded recent media window for familiarity matching."""
+        gid = str(group_id or "").strip()
+        if not gid:
+            return []
+        if not self._db_conn:
+            self.init_db_conn()
+        cur = None
+        try:
+            max_rows = max(1, min(4000, int(limit or 1200)))
+            ex_mid = str(exclude_message_id or "").strip()
+            cur = self._db_conn.cursor()
+            if ex_mid:
+                cur.execute(
+                    """
+                    SELECT message_id, sender_id, sender_name, text,
+                           image_urls_json, created_at
+                    FROM raw_group_messages
+                    WHERE group_id = ?
+                      AND length(image_urls_json) > 2
+                      AND message_id <> ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (gid, ex_mid, max_rows),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT message_id, sender_id, sender_name, text,
+                           image_urls_json, created_at
+                    FROM raw_group_messages
+                    WHERE group_id = ?
+                      AND length(image_urls_json) > 2
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (gid, max_rows),
+                )
+            rows = cur.fetchall()
+            return [
+                {
+                    "message_id": str(r[0] or ""),
+                    "sender_id": str(r[1] or ""),
+                    "sender_name": str(r[2] or ""),
+                    "text": str(r[3] or ""),
+                    "image_urls_json": str(r[4] or ""),
+                    "created_at": float(r[5] or 0.0),
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            logger.error(f"[mem_chat] Failed to get recent media messages: {e}")
+            return []
+        finally:
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+
+    async def get_media_familiarity_captions(
+        self,
+        scope_id: str,
+        fingerprints: list[str],
+    ) -> dict[str, str]:
+        """Return cached image captions for stable fingerprints in one scope."""
+        scope = str(scope_id or "").strip()
+        unique = list(
+            dict.fromkeys(str(fp or "").strip() for fp in (fingerprints or []))
+        )
+        unique = [fp for fp in unique if fp]
+        if not scope or not unique:
+            return {}
+        if not self._db_conn:
+            self.init_db_conn()
+        result: dict[str, str] = {}
+        cur = None
+        try:
+            cur = self._db_conn.cursor()
+            for start in range(0, len(unique), 400):
+                chunk = unique[start : start + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                cur.execute(
+                    f"""
+                    SELECT fingerprint, caption
+                    FROM media_familiarity
+                    WHERE scope_id = ?
+                      AND fingerprint IN ({placeholders})
+                      AND length(trim(COALESCE(caption, ''))) > 0
+                    """,
+                    (scope, *chunk),
+                )
+                for fingerprint, caption in cur.fetchall():
+                    fp = str(fingerprint or "").strip()
+                    cap = str(caption or "").strip()
+                    if fp and cap:
+                        result[fp] = cap
+            return result
+        except Exception as e:
+            logger.error(f"[mem_chat] Failed to get media familiarity captions: {e}")
+            return {}
+        finally:
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+
+    async def set_media_familiarity_caption(
+        self,
+        *,
+        scope_id: str,
+        fingerprint: str,
+        caption: str,
+    ) -> bool:
+        """Backfill a missing caption without changing occurrence counters."""
+        scope = str(scope_id or "").strip()
+        fp = str(fingerprint or "").strip()
+        cap = str(caption or "").strip()[:800]
+        if not scope or not fp or not cap:
+            return False
+        if not self._db_conn:
+            self.init_db_conn()
+        async with self._db_write_lock:
+            cur = None
+            try:
+                cur = self._db_conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE media_familiarity
+                    SET caption = ?
+                    WHERE scope_id = ?
+                      AND fingerprint = ?
+                      AND length(trim(COALESCE(caption, ''))) = 0
+                    """,
+                    (cap, scope, fp),
+                )
+                changed = int(cur.rowcount or 0) > 0
+                self._db_conn.commit()
+                return changed
+            except Exception as e:
+                logger.error(
+                    f"[mem_chat] Failed to backfill media caption: {e}"
+                )
+                return False
+            finally:
+                if cur is not None:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+
+    async def record_media_familiarity(
+        self,
+        *,
+        scope_id: str,
+        fingerprint: str,
+        caption: str = "",
+        message_id: str = "",
+        observed_at: float | None = None,
+        prior_occurrences: int = 0,
+        first_seen_at: float = 0.0,
+        last_seen_at: float = 0.0,
+        last_sender_name: str = "",
+        current_sender_name: str = "",
+    ) -> dict:
+        """Persist one occurrence and return the count before/after this message.
+
+        The message-id guard makes repeated processing of the same event
+        idempotent, so a retry cannot inflate a meme's apparent frequency.
+        """
+        scope = str(scope_id or "").strip()
+        fp = str(fingerprint or "").strip()
+        if not scope or not fp:
+            return {}
+        if not self._db_conn:
+            self.init_db_conn()
+        now = float(observed_at or time.time())
+        mid = str(message_id or "").strip()
+        cap = str(caption or "").strip()[:800]
+        previous_sender = str(last_sender_name or "").strip()[:120]
+        current_sender = str(current_sender_name or "").strip()[:120]
+        previous_first = float(first_seen_at or 0.0)
+        previous_last = float(last_seen_at or 0.0)
+
+        async with self._db_write_lock:
+            cur = None
+            try:
+                cur = self._db_conn.cursor()
+                cur.execute(
+                    """
+                    SELECT seen_count, first_seen_at, last_seen_at,
+                           last_message_id, last_sender_name
+                    FROM media_familiarity
+                    WHERE scope_id = ? AND fingerprint = ?
+                    """,
+                    (scope, fp),
+                )
+                row = cur.fetchone()
+                if row and mid and str(row[3] or "").strip() == mid:
+                    return {
+                        "seen_count": int(row[0] or 0),
+                        "first_seen_at": float(row[1] or 0.0),
+                        "last_seen_at": float(row[2] or 0.0),
+                        "last_sender_name": str(row[4] or ""),
+                        "duplicate_message": True,
+                    }
+
+                if row:
+                    seen_count = max(
+                        max(1, int(row[0] or 0)) + 1,
+                        max(0, int(prior_occurrences or 0)) + 1,
+                    )
+                    first_seen = min(
+                        x
+                        for x in (float(row[1] or now), previous_first or now, now)
+                        if x > 0
+                    )
+                    previous_last = float(row[2] or previous_last or 0.0)
+                    previous_sender = previous_sender or str(row[4] or "")
+                    stored_sender = current_sender or previous_sender
+                else:
+                    seen_count = max(1, int(prior_occurrences or 0) + 1)
+                    first_seen = min(
+                        x for x in (previous_first or now, now) if x > 0
+                    )
+                    stored_sender = current_sender
+
+                cur.execute(
+                    """
+                    INSERT INTO media_familiarity(
+                        scope_id, fingerprint, caption, seen_count,
+                        first_seen_at, last_seen_at, last_message_id, last_sender_name
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(scope_id, fingerprint) DO UPDATE SET
+                        caption=excluded.caption,
+                        seen_count=excluded.seen_count,
+                        first_seen_at=excluded.first_seen_at,
+                        last_seen_at=excluded.last_seen_at,
+                        last_message_id=excluded.last_message_id,
+                        last_sender_name=excluded.last_sender_name
+                    """,
+                    (
+                        scope,
+                        fp,
+                        cap,
+                        seen_count,
+                        first_seen,
+                        now,
+                        mid,
+                        stored_sender,
+                    ),
+                )
+                self._db_conn.commit()
+                return {
+                    "seen_count": seen_count,
+                    "first_seen_at": first_seen,
+                    "last_seen_at": previous_last,
+                    "previous_sender_name": previous_sender,
+                    "duplicate_message": False,
+                }
+            except Exception as e:
+                logger.error(f"[mem_chat] Failed to record media familiarity: {e}")
+                return {}
+            finally:
+                if cur is not None:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+
+    @staticmethod
+    def _clean_media_alias(value: object) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        text = text.strip(" \t\r\n「」『』“”\"'`《》〈〉()（）[]【】，。！？、,.!?;；:：")
+        if not text or len(text) > 24:
+            return ""
+        if any(ch in text for ch in "[]<>"):
+            return ""
+        return text
+
+    async def get_media_aliases(
+        self,
+        *,
+        scope_id: str,
+        fingerprint: str,
+        limit: int = 8,
+    ) -> list[dict]:
+        """Return aliases known for one image in one chat scope."""
+        scope = str(scope_id or "").strip()
+        fp = str(fingerprint or "").strip()
+        if not scope or not fp:
+            return []
+        if not self._db_conn:
+            self.init_db_conn()
+        cur = None
+        try:
+            max_rows = max(1, min(20, int(limit or 8)))
+            cur = self._db_conn.cursor()
+            cur.execute(
+                """
+                SELECT alias, source_sender_name, source_message_id, updated_at
+                FROM media_aliases
+                WHERE scope_id = ? AND fingerprint = ?
+                ORDER BY updated_at DESC, alias ASC
+                LIMIT ?
+                """,
+                (scope, fp, max_rows),
+            )
+            return [
+                {
+                    "alias": str(row[0] or ""),
+                    "source_sender_name": str(row[1] or ""),
+                    "source_message_id": str(row[2] or ""),
+                    "updated_at": float(row[3] or 0.0),
+                }
+                for row in cur.fetchall()
+            ]
+        except Exception as e:
+            logger.error(f"[mem_chat] Failed to get media aliases: {e}")
+            return []
+        finally:
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+
+    async def get_media_aliases_batch(
+        self,
+        *,
+        scope_id: str,
+        fingerprints: list[str],
+        limit_per_image: int = 8,
+    ) -> dict[str, list[dict]]:
+        """Fetch aliases for the current image batch without N+1 queries."""
+        scope = str(scope_id or "").strip()
+        fps = list(
+            dict.fromkeys(
+                str(fp or "").strip()
+                for fp in (fingerprints or [])
+                if str(fp or "").strip()
+            )
+        )[:64]
+        if not scope or not fps:
+            return {}
+        if not self._db_conn:
+            self.init_db_conn()
+        cur = None
+        try:
+            placeholders = ",".join("?" for _ in fps)
+            cur = self._db_conn.cursor()
+            cur.execute(
+                f"""
+                SELECT fingerprint, alias, source_sender_name,
+                       source_message_id, updated_at
+                FROM media_aliases
+                WHERE scope_id = ? AND fingerprint IN ({placeholders})
+                ORDER BY fingerprint, updated_at DESC, alias ASC
+                """,
+                (scope, *fps),
+            )
+            grouped: dict[str, list[dict]] = {fp: [] for fp in fps}
+            max_rows = max(1, min(20, int(limit_per_image or 8)))
+            for row in cur.fetchall():
+                fp = str(row[0] or "")
+                if fp not in grouped or len(grouped[fp]) >= max_rows:
+                    continue
+                grouped[fp].append(
+                    {
+                        "alias": str(row[1] or ""),
+                        "source_sender_name": str(row[2] or ""),
+                        "source_message_id": str(row[3] or ""),
+                        "updated_at": float(row[4] or 0.0),
+                    }
+                )
+            return grouped
+        except Exception as e:
+            logger.error(f"[mem_chat] Failed to get media aliases batch: {e}")
+            return {}
+        finally:
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+
+    async def set_media_alias(
+        self,
+        *,
+        scope_id: str,
+        fingerprint: str,
+        alias: str,
+        replace: bool = False,
+        source_sender_id: str = "",
+        source_sender_name: str = "",
+        source_message_id: str = "",
+    ) -> dict:
+        """Add one alias, or replace every alias for the image when requested."""
+        scope = str(scope_id or "").strip()
+        fp = str(fingerprint or "").strip()
+        name = self._clean_media_alias(alias)
+        if not scope or not fp or not name:
+            return {}
+        if not self._db_conn:
+            self.init_db_conn()
+        now = time.time()
+        sid = str(source_sender_id or "").strip()[:120]
+        sname = str(source_sender_name or "").strip()[:120]
+        mid = str(source_message_id or "").strip()[:180]
+
+        async with self._db_write_lock:
+            cur = None
+            try:
+                cur = self._db_conn.cursor()
+                if replace:
+                    cur.execute(
+                        "DELETE FROM media_aliases WHERE scope_id = ? AND fingerprint = ?",
+                        (scope, fp),
+                    )
+                cur.execute(
+                    """
+                    INSERT INTO media_aliases(
+                        scope_id, fingerprint, alias, source_sender_id,
+                        source_sender_name, source_message_id, created_at, updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(scope_id, fingerprint, alias) DO UPDATE SET
+                        source_sender_id=excluded.source_sender_id,
+                        source_sender_name=excluded.source_sender_name,
+                        source_message_id=excluded.source_message_id,
+                        updated_at=excluded.updated_at
+                    """,
+                    (scope, fp, name, sid, sname, mid, now, now),
+                )
+                # Keep the prompt bounded even if many people invent names.
+                cur.execute(
+                    """
+                    DELETE FROM media_aliases
+                    WHERE scope_id = ? AND fingerprint = ?
+                      AND alias NOT IN (
+                          SELECT alias FROM media_aliases
+                          WHERE scope_id = ? AND fingerprint = ?
+                          ORDER BY updated_at DESC, alias ASC
+                          LIMIT 8
+                      )
+                    """,
+                    (scope, fp, scope, fp),
+                )
+                cur.execute(
+                    """
+                    SELECT alias FROM media_aliases
+                    WHERE scope_id = ? AND fingerprint = ?
+                    ORDER BY updated_at DESC, alias ASC
+                    LIMIT 8
+                    """,
+                    (scope, fp),
+                )
+                aliases = [str(row[0] or "") for row in cur.fetchall() if row[0]]
+                self._db_conn.commit()
+                return {
+                    "scope_id": scope,
+                    "fingerprint": fp,
+                    "alias": name,
+                    "aliases": aliases,
+                    "replaced": bool(replace),
+                }
+            except Exception as e:
+                try:
+                    self._db_conn.rollback()
+                except Exception:
+                    pass
+                logger.error(f"[mem_chat] Failed to set media alias: {e}")
+                return {}
+            finally:
+                if cur is not None:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+
+    async def delete_media_alias(
+        self,
+        *,
+        scope_id: str,
+        fingerprint: str,
+        alias: str,
+    ) -> dict:
+        """Delete one alias for an image, leaving other aliases untouched."""
+        scope = str(scope_id or "").strip()
+        fp = str(fingerprint or "").strip()
+        name = self._clean_media_alias(alias)
+        if not scope or not fp or not name:
+            return {}
+        if not self._db_conn:
+            self.init_db_conn()
+        async with self._db_write_lock:
+            cur = None
+            try:
+                cur = self._db_conn.cursor()
+                cur.execute(
+                    "DELETE FROM media_aliases WHERE scope_id = ? AND fingerprint = ? AND alias = ?",
+                    (scope, fp, name),
+                )
+                deleted = int(cur.rowcount or 0)
+                cur.execute(
+                    """
+                    SELECT alias FROM media_aliases
+                    WHERE scope_id = ? AND fingerprint = ?
+                    ORDER BY updated_at DESC, alias ASC
+                    LIMIT 8
+                    """,
+                    (scope, fp),
+                )
+                aliases = [str(row[0] or "") for row in cur.fetchall() if row[0]]
+                self._db_conn.commit()
+                return {
+                    "scope_id": scope,
+                    "fingerprint": fp,
+                    "alias": name,
+                    "deleted": deleted,
+                    "aliases": aliases,
+                }
+            except Exception as e:
+                try:
+                    self._db_conn.rollback()
+                except Exception:
+                    pass
+                logger.error(f"[mem_chat] Failed to delete media alias: {e}")
+                return {}
+            finally:
+                if cur is not None:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
 
     async def backfill_raw_group_messages_from_memory_embeddings(
         self,

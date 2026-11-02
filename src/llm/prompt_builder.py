@@ -64,6 +64,7 @@ def build_decision_prompt(
     history_lines: list[str] | None = None,
     mood_text: str | None = None,
     target_block: str | None = None,
+    batch_mode: bool = False,
 ) -> str:
     tmpl = _get(
         cfg,
@@ -72,13 +73,26 @@ def build_decision_prompt(
     )
     base = tmpl.format(umo=umo, last_msg=last_msg or "", reply_line=reply_line or "")
     target = reply_line or (last_msg or "")
-    clean_history = _dedupe_history_lines_against_target(history_lines, target)
+    clean_history = _dedupe_history_lines_against_target(
+        history_lines, "" if batch_mode else target
+    )
     parts = []
-    if target_block:
+    if target_block and not batch_mode:
         parts.append(str(target_block).strip())
     if clean_history:
         parts.append("【最新消息上下文】\n" + "\n".join(clean_history))
-    if target:
+    if batch_mode:
+        parts.append(
+            "【本轮回应安排】\n"
+            "上面是一轮待处理的群聊对话，请整体阅读，结合每条消息的发言人、@对象、引用关系和话题安排回应。"
+            "其中明确@你、回复你或戳你的消息，是本轮需要关注的对话；普通群友后续的闲聊不会替换这些消息。"
+            "你可以自然地选择回应哪些内容，也可以选择 no_reply。"
+            "需要回应多人或多个话题时，用 response.segments 分别发送，并在对应段选择各自的 quote_index。"
+            "末尾一条只是时间上最新，不代表本轮唯一或最重要的回复目标。"
+        )
+        if mood_text:
+            parts.append(f"[上一轮mood.text] {str(mood_text).strip()}")
+    elif target:
         extra = ""
         if mood_text:
             extra = f"\n[上一轮mood.text] {str(mood_text).strip()}"
@@ -96,6 +110,7 @@ def build_focus_prompt(
     history_lines: list[str] | None = None,
     mood_text: str | None = None,
     target_block: str | None = None,
+    batch_mode: bool = False,
 ) -> str:
     tmpl = _get(
         cfg,
@@ -104,13 +119,26 @@ def build_focus_prompt(
     )
     base = tmpl.format(umo=umo, last_msg=last_msg or "", reply_line=reply_line or "")
     target = reply_line or (last_msg or "")
-    clean_history = _dedupe_history_lines_against_target(history_lines, target)
+    clean_history = _dedupe_history_lines_against_target(
+        history_lines, "" if batch_mode else target
+    )
     parts = []
-    if target_block:
+    if target_block and not batch_mode:
         parts.append(str(target_block).strip())
     if clean_history:
         parts.append("【最新消息上下文】\n" + "\n".join(clean_history))
-    if target:
+    if batch_mode:
+        parts.append(
+            "【本轮回应安排】\n"
+            "上面是一轮待处理的群聊对话，请整体阅读，结合每条消息的发言人、@对象、引用关系和话题安排回应。"
+            "其中明确@你、回复你或戳你的消息，是本轮需要关注的对话；普通群友后续的闲聊不会替换这些消息。"
+            "你可以自然地选择回应哪些内容，也可以选择 no_reply。"
+            "需要回应多人或多个话题时，用 response.segments 分别发送，并在对应段选择各自的 quote_index。"
+            "末尾一条只是时间上最新，不代表本轮唯一或最重要的回复目标。"
+        )
+        if mood_text:
+            parts.append(f"[上一轮mood.text] {str(mood_text).strip()}")
+    elif target:
         extra = ""
         if mood_text:
             extra = f"\n[上一轮mood.text] {str(mood_text).strip()}"

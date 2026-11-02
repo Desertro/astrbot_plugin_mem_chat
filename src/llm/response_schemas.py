@@ -166,6 +166,9 @@ class StructuredResponse:
             "memory_importance",
             "tools",
             "tool_calls",
+            # Persistent private-chat scene controller metadata.  This block is
+            # runtime state, never visible chat text.
+            "scene",
         }
 
         # 兼容 DeepSeek/OAI 格式的 tools 字段 → tool_calls
@@ -314,8 +317,15 @@ class StructuredResponse:
         if not s:
             return False
 
-        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+        if s.startswith("{") and s.endswith("}"):
             return True
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                json.loads(s)
+                return True
+            except (json.JSONDecodeError, TypeError):
+                # [表情:...] is a valid legacy reply tag, not metadata JSON.
+                pass
 
         meta_patterns = (
             r'"\s*confidence\s*"\s*:\s*[0-9.]+',
@@ -481,6 +491,61 @@ class StructuredResponse:
             raise
 
     @staticmethod
+    def _parse_json_object_at(text: str, start: int) -> dict[str, Any] | None:
+        """Parse one JSON object beginning at *start*, ignoring trailing text.
+
+        Models sometimes append XML-like sidecar blocks after an otherwise valid
+        response object. json.loads rejects that whole string, so use
+        raw_decode to consume only the leading object.
+        """
+        candidate = text[start:]
+        attempts = [candidate]
+        repaired = StructuredResponse._repair_unescaped_quotes_in_json_strings(candidate)
+        if repaired != candidate:
+            attempts.append(repaired)
+        for raw in attempts:
+            try:
+                parsed, _end = json.JSONDecoder().raw_decode(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
+    @staticmethod
+    def _merge_tagged_metadata(text: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Merge metadata emitted as <mood>...</mood> style sidecar blocks."""
+        import re
+
+        if not isinstance(payload, dict) or not isinstance(text, str):
+            return payload
+        for key in (
+            "mood",
+            "affinity",
+            "memory_importance",
+            "impression_delta",
+            "session_impression_summary",
+        ):
+            if key in payload:
+                continue
+            match = re.search(
+                rf"<{key}>\s*([\s\S]*?)\s*</{key}>", text, flags=re.IGNORECASE
+            )
+            if not match:
+                continue
+            raw = match.group(1).strip()
+            if not raw:
+                continue
+            try:
+                payload[key] = json.loads(raw)
+            except json.JSONDecodeError:
+                try:
+                    payload[key] = StructuredResponse._loads_json_with_repair(raw)
+                except json.JSONDecodeError:
+                    continue
+        return payload
+
+    @staticmethod
     def extract_json_from_text(text: str) -> dict[str, Any] | None:
         import re
 
@@ -489,7 +554,9 @@ class StructuredResponse:
         try:
             parsed = StructuredResponse._loads_json_with_repair(text)
             if isinstance(parsed, dict):
-                return StructuredResponse.normalize_response_dict(parsed)
+                return StructuredResponse._merge_tagged_metadata(
+                    text, StructuredResponse.normalize_response_dict(parsed)
+                )
             if isinstance(parsed, list):
                 for item in reversed(parsed):
                     if isinstance(item, dict):
@@ -510,7 +577,10 @@ class StructuredResponse:
                     try:
                         parsed = StructuredResponse._loads_json_with_repair(content)
                         if isinstance(parsed, dict):
-                            return StructuredResponse.normalize_response_dict(parsed)
+                            return StructuredResponse._merge_tagged_metadata(
+                                text,
+                                StructuredResponse.normalize_response_dict(parsed),
+                            )
                         if isinstance(parsed, list):
                             for item in reversed(parsed):
                                 if isinstance(item, dict):
@@ -518,39 +588,32 @@ class StructuredResponse:
                     except json.JSONDecodeError:
                         continue
 
+        # Prefer the first complete JSON object that looks like a reply. Scanning
+        # left-to-right matters when the model appends <mood>{"..."}</mood> after
+        # the main object: scanning from the right would otherwise select the
+        # sidecar and discard the actual response.
         try:
-            start_idx = text.rfind("{")
-            end_idx = text.rfind("}")
-
-            if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
-                content_to_end = text[: end_idx + 1]
-                start_positions = [
-                    m.start() for m in re.finditer(r"\{", content_to_end)
-                ]
-
-                for pos in reversed(start_positions):
-                    try:
-                        potential_json = content_to_end[pos:]
-                        parsed = StructuredResponse._loads_json_with_repair(potential_json)
-                        if isinstance(parsed, dict):
-                            if "response" in parsed or "control" in parsed:
-                                return StructuredResponse.normalize_response_dict(
-                                    parsed
-                                )
-                    except json.JSONDecodeError:
-                        continue
+            for match in re.finditer(r"\{", text):
+                parsed = StructuredResponse._parse_json_object_at(text, match.start())
+                if isinstance(parsed, dict) and (
+                    "response" in parsed or "control" in parsed
+                ):
+                    return StructuredResponse._merge_tagged_metadata(
+                        text, StructuredResponse.normalize_response_dict(parsed)
+                    )
         except Exception:
             pass
 
         try:
             match = re.search(r"(\{[\s\S]*\})", text)
             if match:
-                try:
-                    parsed = StructuredResponse._loads_json_with_repair(match.group(1))
-                    if isinstance(parsed, dict):
-                        return StructuredResponse.normalize_response_dict(parsed)
-                except json.JSONDecodeError:
-                    pass
+                parsed = StructuredResponse._parse_json_object_at(match.group(1), 0)
+                if isinstance(parsed, dict) and (
+                    "response" in parsed or "control" in parsed
+                ):
+                    return StructuredResponse._merge_tagged_metadata(
+                        text, StructuredResponse.normalize_response_dict(parsed)
+                    )
         except Exception:
             pass
 

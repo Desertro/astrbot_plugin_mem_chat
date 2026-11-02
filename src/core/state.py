@@ -30,6 +30,7 @@ class MemChatState:
         self.last_cycle_cutoff: dict[str, float] = {}
         self.bot_self_ids: dict[str, str] = {}
         self.bot_self_names: dict[str, str] = {}
+        self.group_member_counts: dict[str, int] = {}
         self.interrupt_flags: dict[str, bool] = {}
         self.processing_flags: dict[str, bool] = {}
         self.summary_msg_counts: dict[str, int] = {}
@@ -215,7 +216,9 @@ class MemChatState:
             for k in expired:
                 bucket.pop(k, None)
             if len(bucket) >= max_size:
-                oldest = sorted(bucket.items(), key=lambda kv: kv[1])[: max(1, max_size // 8)]
+                oldest = sorted(bucket.items(), key=lambda kv: kv[1])[
+                    : max(1, max_size // 8)
+                ]
                 for k, _ in oldest:
                     bucket.pop(k, None)
         bucket[mid] = now
@@ -385,6 +388,19 @@ class MemChatState:
 
     def get_self_name(self, umo: str) -> str | None:
         return self.bot_self_names.get(umo)
+
+    def set_group_member_count(self, group_id: str, member_count: int):
+        gid = str(group_id or "").strip()
+        try:
+            count = int(member_count or 0)
+        except Exception:
+            count = 0
+        if gid and count > 0:
+            self.group_member_counts[gid] = count
+
+    def get_group_member_count(self, group_id: str) -> int:
+        gid = str(group_id or "").strip()
+        return int(self.group_member_counts.get(gid, 0) or 0)
 
     def add_session(self, umo: str):
         if umo:
@@ -559,7 +575,8 @@ class MemChatState:
                 expired = [
                     k
                     for k, v in s_map.items()
-                    if v is not None and now - float(v[3] or 0.0) > reply_summaries_ttl_sec
+                    if v is not None
+                    and now - float(v[3] or 0.0) > reply_summaries_ttl_sec
                 ]
                 for k in expired:
                     s_map.pop(k, None)
@@ -680,7 +697,9 @@ class MemChatState:
             bucket[s] = now
 
         if ttl_sec > 0 and bucket:
-            expired = [k for k, ts in bucket.items() if now - float(ts or 0.0) > ttl_sec]
+            expired = [
+                k for k, ts in bucket.items() if now - float(ts or 0.0) > ttl_sec
+            ]
             for k in expired:
                 bucket.pop(k, None)
 
@@ -762,6 +781,24 @@ class MemChatState:
             self.pending_msgs.pop(umo, None)
         else:
             self.pending_msgs[umo] = new_buf
+
+    def consume_pending_messages(
+        self, umo: str, messages: list[tuple[str, str, str, str, float]]
+    ):
+        """Remove only the snapshot read by a completed reply cycle.
+
+        Args:
+            umo: Conversation scope.
+            messages: Exact pending rows included in the cycle.
+        """
+        consumed = set(messages)
+        if not consumed or umo not in self.pending_msgs:
+            return
+        remaining = [row for row in self.pending_msgs[umo] if row not in consumed]
+        if remaining:
+            self.pending_msgs[umo] = remaining
+        else:
+            self.pending_msgs.pop(umo, None)
 
     def clear_pending_first_n(self, umo: str, n: int):
         if not umo or n <= 0:

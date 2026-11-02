@@ -162,7 +162,8 @@
   "heartbeat_cycle": {
     "description": "心跳周期(秒)",
     "type": "int",
-    "default": 60
+    "default": 300,
+    "hint": "群消息触发读空气的等待周期。设为 300 秒时，安静小群不会因为一两条消息频繁触发；活跃大群仍会自然积累上下文后判定。"
   },
   "raw_messages_backfill_on_startup": {
     "description": "启动时回填历史到raw消息表",
@@ -499,10 +500,10 @@
     "hint": "开启后会根据 mood 状态更新每个群成员的 affinity/trust，并注入【关系倾向】。"
   },
   "affinity_update_require_at": {
-    "description": "仅在点名机器人时更新好感",
+    "description": "仅点名时更新好感（关闭后主动接话也计入）",
     "type": "bool",
-    "default": true,
-    "hint": "开启后仅在 AT/点名机器人场景写入 affinity，避免误把群聊路人消息计入关系变化。"
+    "default": false,
+    "hint": "默认关闭：只要爱丽丝真的发出回复，就按 LLM 的 affinity.delta 更新当前发言人；开启后仅 AT/点名场景更新。"
   },
   "affinity_mood_delta_enabled": {
     "description": "启用 mood 对好感的影响",
@@ -566,7 +567,7 @@
   "affinity_new_user_factor_start": {
     "description": "新用户初始系数",
     "type": "float",
-    "default": 0.4
+    "default": 0.8
   },
   "affinity_new_user_factor_end": {
     "description": "新用户窗口结束系数",
@@ -659,7 +660,8 @@
   "decision_msg_count_min": {
     "description": "读空气消息下限(小于此值不判定)",
     "type": "int",
-    "default": 1
+    "default": 5,
+    "hint": "读空气触发前至少需要的新消息数。配合 heartbeat_cycle 使用：小群需要更多真实对话才会触发，大群在活跃时更容易达到门槛。"
   },
   "enable_enhanced_memory": {
     "description": "启用增强记忆",
@@ -979,5 +981,251 @@
     "type": "bool",
     "default": true,
     "hint": "在回复的同一次请求里附带输出 memory_importance（1-10），归一化后写入 importance 列，供三因子召回排序使用。不增加额外 LLM 请求；关闭后所有新记忆都用 ga_importance_default。"
+  },
+  "scene_engine_enabled": {
+    "description": "启用私聊持续场景引擎",
+    "type": "bool",
+    "default": true,
+    "hint": "仅对 private_chat_uids 白名单私聊生效。模型只在对方明确要求持续角色扮演、连续推进或持续跟进时输出 scene 状态，由运行时按节奏唤醒；普通聊天不会触发。"
+  },
+  "scene_adult_mode": {
+    "description": "允许成人场景内容",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后普通持续角色扮演/陪伴场景仍可用，但禁止成人内容。成人内容仅限双方明确同意的成年人私聊。"
+  },
+  "scene_max_duration_sec": {
+    "description": "单次场景最长持续时间（秒）",
+    "type": "int",
+    "default": 480,
+    "hint": "硬截止时间。到达后不再自动推进，避免无限循环。"
+  },
+  "scene_max_messages": {
+    "description": "单次场景最多发送消息数",
+    "type": "int",
+    "default": 18,
+    "hint": "按实际发送成功的消息计数；包含每拍 1-3 条短消息。"
+  },
+  "scene_max_ticks": {
+    "description": "单次场景最多自主唤醒次数",
+    "type": "int",
+    "default": 18,
+    "hint": "每次唤醒只生成一小拍。该值与 max_messages 共同封顶。"
+  },
+  "scene_min_interval_sec": {
+    "description": "场景自主拍最小间隔（秒）",
+    "type": "int",
+    "default": 8,
+    "hint": "LLM 给出的 next_tick_sec 会被限制在该值以上。"
+  },
+  "scene_max_interval_sec": {
+    "description": "场景自主拍最大间隔（秒）",
+    "type": "int",
+    "default": 45,
+    "hint": "LLM 不能把下一次唤醒安排得比该值更晚。"
+  },
+  "scene_after_reply_delay_sec": {
+    "description": "用户回复后下一拍延迟（秒）",
+    "type": "int",
+    "default": 8,
+    "hint": "用户刚发消息时先让普通回复完成，再等待该时间进入下一拍。"
+  },
+  "scene_continuous_interval_sec": {
+    "description": "连续发送模式的自主拍间隔（秒）",
+    "type": "int",
+    "default": 8,
+    "hint": "仅在用户明确说连着发、连续发、一直发、五分钟、别停等连续发送要求时启用；仍受 scene_min_interval_sec 下限约束。"
+  },
+  "scene_continuous_default_sec": {
+    "description": "未指定时长时的连续发送时长（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "例如只说一直发但没有给分钟数时使用；一直发、不要停等不收尾措辞会延长到 scene_max_duration_sec。"
+  },
+  "scene_continuous_max_messages": {
+    "description": "连续发送模式的消息上限",
+    "type": "int",
+    "default": 160,
+    "hint": "连续模式单独使用该上限，避免五分钟高频短消息过早撞到普通场景的 scene_max_messages；普通场景仍使用原上限。"
+  },
+  "scene_idle_soft_limit_sec": {
+    "description": "用户静默软提醒阈值（秒）",
+    "type": "int",
+    "default": 90,
+    "hint": "超过该时间没有用户回应时，提示模型放慢节奏、确认或自然收束，不假定对方仍在强烈同意。"
+  },
+  "scene_stop_keywords": {
+    "description": "场景停止关键词",
+    "type": "list",
+    "default": [
+      "停下",
+      "停止",
+      "结束",
+      "不要了",
+      "不继续",
+      "退出场景",
+      "取消场景",
+      "算了"
+    ],
+    "hint": "私聊消息命中这些词时立即停止自主推进；“别停/不要停/继续”等会按继续处理。"
+  },
+  "meme_visual_selection_enabled": {
+    "description": "发送前看图核对表情包",
+    "type": "bool",
+    "default": true,
+    "hint": "对最多8张候选原图做最终选择；优先独立识图模型，未配置时使用对话模型。均不贴切或核对失败时不硬发表情。"
+  },
+  "media_familiarity_enabled": {
+    "description": "注入表情包熟悉度",
+    "type": "bool",
+    "default": true,
+    "hint": "统计当前会话里重复出现的图片，把出现次数和上次出现时间作为事实提供给模型。模型仍自主决定是否吐槽；不会生成固定台词。"
+  },
+  "media_familiarity_scan_limit": {
+    "description": "表情熟悉度回看消息数",
+    "type": "int",
+    "default": 1200,
+    "hint": "每条带图消息最多回看当前会话最近多少条带图原始消息做首次匹配。建议 800-2000；数值越大越能认出久远的复读图，但会增加少量查询与文件哈希开销。"
+  },
+  "media_alias_enabled": {
+    "description": "允许学习图片称呼",
+    "type": "bool",
+    "default": true,
+    "hint": "同一会话里明确说“这个表情包是大肥鱼/以后叫它大肥鱼”时，保存与该图片指纹绑定的称呼；以后同一张图会带上称呼提示。普通玩梗、疑问、否定不会自动绑定。"
+  },
+  "media_alias_recent_image_max_age_sec": {
+    "description": "无引用时图片称呼回看秒数",
+    "type": "int",
+    "default": 180,
+    "hint": "当模型判断某句话在给图命名、但消息没有直接附图或引用时，最多回看当前会话最近多少秒内的一张图。设为 0 可关闭这项兜底。"
+  },
+  "codex_enabled": {
+    "description": "启用 Codex 桥接工具",
+    "type": "bool",
+    "default": true,
+    "hint": "注册 codex_agent 工具；默认只允许 codex_allowed_uids（未配置时回退 private_chat_uids）在私聊调用。"
+  },
+  "codex_cli_path": {
+    "description": "Codex CLI 路径",
+    "type": "string",
+    "default": "/mnt/c/Users/Desertro/AppData/Local/Programs/Codex CLI/bin/codex.exe"
+  },
+  "codex_workdir": {
+    "description": "Codex 工作目录",
+    "type": "string",
+    "default": "\\\\wsl.localhost\\Ubuntu\\home\\desertro"
+  },
+  "codex_model": {
+    "description": "Codex 使用的模型",
+    "type": "string",
+    "default": "deepseek-v4.1-flash"
+  },
+  "codex_sandbox": {
+    "description": "Codex sandbox 模式",
+    "type": "string",
+    "default": "workspace-write",
+    "options": [
+      "read-only",
+      "workspace-write",
+      "danger-full-access"
+    ]
+  },
+  "codex_timeout_sec": {
+    "description": "Codex 单次调用超时（秒）",
+    "type": "int",
+    "default": 180,
+    "hint": "15～600 秒。codex_agent 不受 llm_tool_timeout_sec 的 60 秒上限限制。"
+  },
+  "codex_allowed_uids": {
+    "description": "允许调用 Codex 的用户 QQ 号",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "留空时回退到 private_chat_uids。不要随意扩大，Codex 会以配置的 sandbox 权限执行。"
+  },
+  "codex_allow_groups": {
+    "description": "允许在群聊调用 Codex",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭，避免群成员借机器人执行本地任务。"
+  },
+  "large_group_frequency_enabled": {
+    "description": "按群人数降低自动回复频率",
+    "type": "bool",
+    "default": true
+  },
+  "large_group_member_threshold": {
+    "description": "大群人数阈值",
+    "type": "int",
+    "default": 100,
+    "hint": "群人数达到该值后启用降频；显式 @ 不受影响。"
+  },
+  "large_group_heartbeat_multiplier": {
+    "description": "大群心跳与专注周期倍数",
+    "type": "float",
+    "default": 1.8,
+    "hint": "大群 READ_AIR 等待时间和 FOCUS 回复周期乘以该值，范围 1～5。"
+  },
+  "large_group_min_message_bonus": {
+    "description": "大群读空气最低消息数增量",
+    "type": "int",
+    "default": 5,
+    "hint": "在 decision_msg_count_min 基础上额外要求这么多条消息。"
+  },
+  "large_group_focus_duration_cap_sec": {
+    "description": "大群专注模式时长上限（秒）",
+    "type": "int",
+    "default": 45,
+    "hint": "防止一次读空气回复后在人多群里持续高频接话。"
+  },
+  "meme_vision": {
+    "type": "object",
+    "description": "表情包独立识图与选图模型",
+    "items": {
+      "enable": {
+        "type": "bool",
+        "description": "启用独立识图模型",
+        "default": false
+      },
+      "base_url": {
+        "type": "string",
+        "description": "识图 OpenAI 兼容站点",
+        "default": ""
+      },
+      "api_key": {
+        "type": "string",
+        "description": "识图 API 密钥",
+        "default": ""
+      },
+      "model": {
+        "type": "string",
+        "description": "识图模型",
+        "default": "gemini-3.8-flash"
+      },
+      "fallback_enabled": {
+        "type": "bool",
+        "description": "启用备用识图站点",
+        "default": false,
+        "hint": "先确认备用站点有可用模型渠道；失败时在原超时预算内切换。"
+      },
+      "fallback_base_url": {
+        "type": "string",
+        "description": "备用识图站点",
+        "default": ""
+      },
+      "fallback_api_key": {
+        "type": "string",
+        "description": "备用识图密钥",
+        "default": ""
+      },
+      "fallback_model": {
+        "type": "string",
+        "description": "备用识图模型",
+        "default": "gemini-3.8-flash"
+      }
+    },
+    "hint": "用于图片描述、存表情识别和发送前视觉复核；关闭时沿用旧模型配置。"
   }
 }

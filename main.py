@@ -8,6 +8,7 @@ import time
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.message.components import (
     At,
     AtAll,
@@ -34,20 +35,50 @@ BLOCKED_PATCH_TOKENS = (
 )
 
 try:
+    from .src.core.codex_service import CodexService
+    from .src.core.media_familiarity import (
+        analyze_recent_media_occurrences,
+        classify_media_kind,
+        extract_media_alias_intent,
+        fill_plain_image_captions,
+        media_reference_fingerprint,
+        pair_captions_with_images,
+        parse_image_refs,
+    )
     from .src.core.models import DummyEvent
     from .src.core.scheduler import Scheduler
     from .src.core.state import MemChatState
     from .src.db.database import DatabaseManager
     from .src.llm_client import LLMClient
+    from .src.scene.engine import SceneEngine
 except ImportError:
     _base_dir = os.path.dirname(__file__)
     if _base_dir and _base_dir not in sys.path:
         sys.path.insert(0, _base_dir)
+    from src.core.codex_service import CodexService
+    from src.core.media_familiarity import (
+        analyze_recent_media_occurrences,
+        classify_media_kind,
+        extract_media_alias_intent,
+        fill_plain_image_captions,
+        media_reference_fingerprint,
+        pair_captions_with_images,
+        parse_image_refs,
+    )
     from src.core.models import DummyEvent
     from src.core.scheduler import Scheduler
     from src.core.state import MemChatState
     from src.db.database import DatabaseManager
     from src.llm_client import LLMClient
+    from src.scene.engine import SceneEngine
+
+
+def _context_image_service(owner):
+    """Resolve the context-image service without assuming a concrete owner type."""
+    service = getattr(owner, "_image_service", None)
+    if service is None:
+        service = getattr(getattr(owner, "llm_client", None), "_image_service", None)
+    return service
 
 
 def _should_ignore_sender(self_id, cached_self_id, sender_id) -> bool:
@@ -67,6 +98,7 @@ class MemChat(Star):
         self.config = config or {}
 
         self.state = MemChatState()
+        self.codex_service = CodexService(self.config)
 
         self._mem_db_path = os.path.join(
             os.path.dirname(__file__), "mem_chat_embeddings.db"
@@ -78,10 +110,75 @@ class MemChat(Star):
         self.scheduler = Scheduler(
             self, self.context, self.config, self.state, self.db_mgr, self.llm_client
         )
+        self.scene_engine = SceneEngine(
+            self, self.config, self.db_mgr, self.llm_client, self.scheduler
+        )
+        self._register_codex_tool()
 
         asyncio.create_task(self._startup_init())
 
         logger.info(f"[mem_chat] Plugin initialized. DB path: {self._mem_db_path}")
+
+    def _register_codex_tool(self):
+        """Register the owner-only Codex bridge as a native LLM tool."""
+        if not bool(self.config.get("codex_enabled", True)):
+            return
+        tool = FunctionTool(
+            name="codex_agent",
+            description=(
+                "在用户明确要求让 Codex 处理任务、询问 Codex、让 Codex 继续之前的工作，"
+                "或要把一段新任务交给 Codex 时调用。普通闲聊不要调用。"
+                "action=new 发起全新 Codex 会话；action=resume 继承当前聊天已绑定的 Codex 会话；"
+                "action=list 列出当前聊天绑定过的 Codex 会话。prompt 必须写清完整任务和上下文。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["new", "resume", "list"],
+                        "description": "new=新会话，resume=继承已有会话，list=列出会话。",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "发给 Codex 的完整消息；new/resume 时必填。",
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "description": "可选的 Codex thread UUID；不填则使用当前聊天最近会话。",
+                    },
+                    "session_name": {
+                        "type": "string",
+                        "description": "可选会话名，用于以后按名称继续。",
+                    },
+                },
+                "required": ["action"],
+                "additionalProperties": False,
+            },
+            # The plugin loader binds the current instance after registration.
+            handler=type(self)._handle_codex_tool,
+        )
+        self.context.add_llm_tools(tool)
+
+    async def _handle_codex_tool(
+        self,
+        event: AstrMessageEvent,
+        action: str = "resume",
+        prompt: str = "",
+        thread_id: str = "",
+        session_name: str = "",
+    ) -> str:
+        try:
+            return await self.codex_service.execute_tool(
+                event,
+                action=action,
+                prompt=prompt,
+                thread_id=thread_id,
+                session_name=session_name,
+            )
+        except Exception as exc:
+            logger.exception("[mem_chat] Codex tool failed")
+            return f"Codex 工具执行失败（{type(exc).__name__}）。不要编造结果。"
 
     def _normalize_target_label(
         self,
@@ -224,6 +321,7 @@ class MemChat(Star):
         at_targets: list[dict],
         at_all: bool,
         poke_meta: dict | None = None,
+        is_private: bool = False,
     ) -> dict:
         explicit_type = "group"
         explicit_id = "group"
@@ -282,6 +380,13 @@ class MemChat(Star):
             )
             reason = "at_all"
             confidence = "medium"
+
+        if is_private and explicit_type == "group":
+            explicit_type, explicit_id, explicit_name = self._normalize_target_label(
+                "user", str(sender_id or "user"), str(sender_name or "对方")
+            )
+            reason = "private_chat"
+            confidence = "high"
 
         inferred_type, inferred_id, inferred_name = (
             explicit_type,
@@ -1065,8 +1170,28 @@ class MemChat(Star):
                 # await event.send("记录下你的品味啦~")
 
     def __del__(self):
+        try:
+            if hasattr(self, "scene_engine") and self.scene_engine:
+                self.scene_engine.shutdown()
+        except Exception:
+            pass
         if hasattr(self, "db_mgr") and self.db_mgr:
             self.db_mgr.close()
+
+    async def terminate(self):
+        """Cancel scene timers cleanly when AstrBot reloads/unloads the plugin."""
+        try:
+            if hasattr(self, "scene_engine") and self.scene_engine:
+                self.scene_engine.shutdown()
+                await asyncio.sleep(0)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "db_mgr") and self.db_mgr:
+                self.db_mgr.close()
+        except Exception:
+            pass
+        logger.info("[mem_chat] Plugin terminated.")
 
     def _get_vision_media(self):
         try:
@@ -1129,7 +1254,417 @@ class MemChat(Star):
         except Exception:
             return self._enrich_text_with_poke_details(event, event.message_str or "")
 
+    @staticmethod
+    def _extract_image_sub_types(event: AstrMessageEvent) -> list[int]:
+        """Read QQ image subtypes in message order (1 means animated sticker)."""
+        sub_types: list[int] = []
+        try:
+            chain = getattr(getattr(event, "message_obj", None), "message", None)
+            for component in chain or []:
+                if not isinstance(component, Image):
+                    continue
+                if not (
+                    getattr(component, "url", None) or getattr(component, "file", None)
+                ):
+                    continue
+                try:
+                    sub_types.append(int(getattr(component, "sub_type", 0) or 0))
+                except Exception:
+                    sub_types.append(0)
+        except Exception:
+            pass
+        return sub_types
+
+    async def _ensure_image_captions(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        image_urls: list[str],
+        scope_id: str,
+    ) -> str:
+        """Persist OCR/image captions before the turn enters chat history.
+
+        vision_media intentionally skips caption generation for private chats
+        whose model supports images. That keeps the current reply fast, but the
+        next turn only sees a plain image marker because raw images are not retained in
+        conversation history. Fill that gap with a durable caption so text in
+        stickers remains answerable after the image itself is gone.
+        """
+        refs = [
+            str(item or "").strip()
+            for item in (image_urls or [])
+            if str(item or "").strip()
+        ]
+        if not refs:
+            return str(text or "")
+        existing = pair_captions_with_images(text, len(refs))
+        if any(str(caption or "").strip() for caption in existing):
+            return str(text or "")
+        scope = str(scope_id or "").strip()
+        fingerprints = [media_reference_fingerprint(ref) for ref in refs]
+        cached: dict[str, str] = {}
+        try:
+            cached = await self.db_mgr.get_media_familiarity_captions(
+                scope,
+                [fp for fp in fingerprints if fp],
+            )
+        except Exception as exc:
+            logger.debug(f"[mem_chat] cached image caption lookup failed: {exc}")
+        captions: list[str] = []
+        generated = 0
+        service = _context_image_service(self)
+        for ref, fingerprint in zip(refs, fingerprints):
+            caption = str(cached.get(fingerprint or "") or "").strip()
+            if not caption and service is not None:
+                try:
+                    caption = str(
+                        await service.describe_image_for_context(ref) or ""
+                    ).strip()
+                except Exception as exc:
+                    logger.debug(f"[mem_chat] context image caption failed: {exc}")
+                    caption = ""
+                if caption:
+                    generated += 1
+            captions.append(caption)
+        enriched = fill_plain_image_captions(text, captions)
+        if enriched != text:
+            logger.info(
+                f"[mem_chat] image captions attached scope={scope} "
+                f"images={len(refs)} generated={generated}"
+            )
+        return enriched
+
+    async def _append_recent_image_context(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        scope_id: str,
+    ) -> str:
+        """Attach a recent image caption when the user follows up without it.
+
+        Private-chat history often keeps only an image marker after the model's
+        current-image vision pass. If a later turn asks what was written on the
+        image, recover the caption from raw media metadata. When an old row has
+        no caption, generate one with the OCR-first vision prompt and persist it
+        so later turns remain correct without another vision request.
+        """
+        raw = str(text or "").rstrip()
+        scope = str(scope_id or "").strip()
+        if not raw or not scope or "[图片内容" in raw:
+            return raw
+
+        # A current image is already available to the chat model. Never mix in
+        # a previous image merely because the current text also says "图片".
+        try:
+            for component in event.get_messages() or []:
+                if isinstance(component, Image) and (
+                    getattr(component, "url", None) or getattr(component, "file", None)
+                ):
+                    return raw
+        except Exception:
+            pass
+
+        message_text = str(getattr(event, "message_str", "") or "")
+        query_tokens = (
+            "看图",
+            "图片",
+            "表情",
+            "表情包",
+            "上面",
+            "写的什么",
+            "什么字",
+            "这张",
+            "那张",
+            "图里",
+            "图中",
+            "这图",
+            "那图",
+        )
+        reply_target_id = ""
+        try:
+            for component in event.get_messages() or []:
+                if isinstance(component, Reply):
+                    reply_target_id = str(getattr(component, "id", "") or "").strip()
+                    if reply_target_id:
+                        break
+        except Exception:
+            reply_target_id = ""
+        if not reply_target_id and not any(
+            token in message_text for token in query_tokens
+        ):
+            return raw
+        try:
+            rows = await self.db_mgr.get_recent_media_messages(scope, limit=20)
+        except Exception:
+            return raw
+        if not rows:
+            return raw
+        selected = None
+        if reply_target_id:
+            selected = next(
+                (
+                    row
+                    for row in rows
+                    if str(row.get("message_id") or "") == reply_target_id
+                ),
+                None,
+            )
+        if selected is None:
+            now = time.time()
+            for row in rows:
+                try:
+                    age = now - float(row.get("created_at") or 0.0)
+                except Exception:
+                    continue
+                if 0 <= age <= 7200:
+                    selected = row
+                    break
+        if selected is None:
+            return raw
+        refs = parse_image_refs(selected.get("image_urls_json"))
+        if not refs:
+            return raw
+        captions = pair_captions_with_images(str(selected.get("text") or ""), len(refs))
+        fingerprints = [media_reference_fingerprint(ref) for ref in refs]
+        if not any(str(caption or "").strip() for caption in captions):
+            try:
+                cached = await self.db_mgr.get_media_familiarity_captions(
+                    scope,
+                    [fp for fp in fingerprints if fp],
+                )
+            except Exception:
+                cached = {}
+            captions = [
+                str(cached.get(fingerprint or "") or "").strip()
+                for fingerprint in fingerprints
+            ]
+
+        service = _context_image_service(self)
+        generated = 0
+        if service is not None:
+            for index, ref in enumerate(refs):
+                if str(captions[index] or "").strip():
+                    continue
+                try:
+                    caption = str(
+                        await service.describe_image_for_context(ref) or ""
+                    ).strip()
+                except Exception as exc:
+                    logger.debug(
+                        f"[mem_chat] recent context image caption failed: {exc}"
+                    )
+                    caption = ""
+                if not caption:
+                    continue
+                captions[index] = caption
+                generated += 1
+                fingerprint = fingerprints[index] if index < len(fingerprints) else None
+                if fingerprint:
+                    try:
+                        await self.db_mgr.set_media_familiarity_caption(
+                            scope_id=scope,
+                            fingerprint=fingerprint,
+                            caption=caption,
+                        )
+                    except Exception as exc:
+                        logger.debug(f"[mem_chat] recent caption persist failed: {exc}")
+
+        lines = [str(caption).strip() for caption in captions if str(caption).strip()]
+        if not lines:
+            return raw
+        block = "\n【最近图片的系统资料】\n" + "\n".join(
+            f"[图片内容: {caption}]" for caption in lines
+        )
+        logger.info(
+            f"[mem_chat] recent image caption attached scope={scope} "
+            f"images={len(lines)} generated={generated}"
+        )
+        return raw + block
+
+    async def _attach_media_familiarity_for_event(
+        self,
+        event: AstrMessageEvent,
+        *,
+        scope_id: str,
+        message_id: str,
+        text: str,
+        image_urls: list[str],
+    ) -> None:
+        """Attach repetition and learned-name facts for the current images.
+
+        Image aliases are chat-scoped and always bind to the same stable image
+        fingerprint used by familiarity matching. Unambiguous naming statements
+        are learned here as a no-reply safety net; ambiguous cases remain the
+        model's decision via hidden alias action tags.
+        """
+        scope = str(scope_id or "").strip()
+        refs = [str(x).strip() for x in (image_urls or []) if str(x or "").strip()]
+        if not scope or not refs:
+            return
+        captions = pair_captions_with_images(text, len(refs))
+        image_sub_types = self._extract_image_sub_types(event)
+        try:
+            scan_limit = int(
+                self.config.get("media_familiarity_scan_limit", 1200) or 1200
+            )
+        except (TypeError, ValueError):
+            scan_limit = 1200
+        rows = await self.db_mgr.get_recent_media_messages(
+            scope,
+            limit=scan_limit,
+            exclude_message_id=message_id,
+        )
+        analyses = await asyncio.to_thread(
+            analyze_recent_media_occurrences,
+            refs,
+            captions,
+            rows,
+        )
+
+        candidates: list[dict] = []
+        seen_fingerprints: set[str] = set()
+        for index, item in enumerate(analyses):
+            fingerprint = str(item.get("fingerprint") or "").strip()
+            if not fingerprint or fingerprint in seen_fingerprints:
+                continue
+            seen_fingerprints.add(fingerprint)
+            sub_type = image_sub_types[index] if index < len(image_sub_types) else 0
+            caption = str(item.get("caption") or "")
+            candidates.append(
+                {
+                    "fingerprint": fingerprint,
+                    "caption": caption,
+                    "media_kind": classify_media_kind(sub_type, caption),
+                    "image_index": len(candidates) + 1,
+                    "analysis": item,
+                    "sub_type": sub_type,
+                }
+            )
+        if not candidates:
+            return
+
+        alias_enabled = bool(self.config.get("media_alias_enabled", True))
+        learned: list[dict] = []
+        if alias_enabled:
+            user_text = str(getattr(event, "message_str", "") or "")
+            intent = extract_media_alias_intent(user_text)
+            if intent:
+                plural_names = bool(
+                    re.search(r"(?:这些|这几张|多张|全都|都叫|统一叫)", user_text)
+                )
+                if len(candidates) == 1 or plural_names:
+                    for candidate in candidates:
+                        fp = str(candidate.get("fingerprint") or "")
+                        action = str(intent.get("action") or "set")
+                        alias = str(intent.get("alias") or "")
+                        if action == "delete":
+                            result = await self.db_mgr.delete_media_alias(
+                                scope_id=scope,
+                                fingerprint=fp,
+                                alias=alias,
+                            )
+                        else:
+                            result = await self.db_mgr.set_media_alias(
+                                scope_id=scope,
+                                fingerprint=fp,
+                                alias=alias,
+                                replace=action == "replace",
+                                source_sender_id=str(event.get_sender_id() or ""),
+                                source_sender_name=str(event.get_sender_name() or ""),
+                                source_message_id=message_id,
+                            )
+                        if result:
+                            learned.append(
+                                {
+                                    "fingerprint": fp,
+                                    "action": action,
+                                    "alias": alias,
+                                }
+                            )
+                else:
+                    logger.info(
+                        f"[mem_chat] explicit alias statement is ambiguous across "
+                        f"{len(candidates)} images; deferring to model action tags"
+                    )
+
+        aliases_by_fp = await self.db_mgr.get_media_aliases_batch(
+            scope_id=scope,
+            fingerprints=[str(c.get("fingerprint") or "") for c in candidates],
+        )
+        entries: list[dict] = []
+        observed_at = time.time()
+        for candidate in candidates:
+            fingerprint = str(candidate.get("fingerprint") or "")
+            item = candidate.get("analysis") or {}
+            record = await self.db_mgr.record_media_familiarity(
+                scope_id=scope,
+                fingerprint=fingerprint,
+                caption=str(item.get("caption") or ""),
+                message_id=message_id,
+                observed_at=observed_at,
+                prior_occurrences=int(item.get("prior_occurrences") or 0),
+                first_seen_at=float(item.get("first_seen_at") or 0.0),
+                last_seen_at=float(item.get("last_seen_at") or 0.0),
+                last_sender_name=str(item.get("last_sender_name") or ""),
+                current_sender_name=str(event.get_sender_name() or ""),
+            )
+            known_aliases = []
+            if alias_enabled:
+                known_aliases = [
+                    str(alias.get("alias") or "")
+                    for alias in (aliases_by_fp.get(fingerprint) or [])
+                    if str(alias.get("alias") or "").strip()
+                ]
+            entries.append(
+                {
+                    "fingerprint": fingerprint,
+                    "caption": str(item.get("caption") or ""),
+                    "media_kind": str(candidate.get("media_kind") or "image"),
+                    "seen_count": int(record.get("seen_count") or 0),
+                    "last_seen_at": float(record.get("last_seen_at") or 0.0),
+                    "last_sender_name": str(
+                        record.get("previous_sender_name")
+                        or item.get("last_sender_name")
+                        or ""
+                    ),
+                    "aliases": known_aliases,
+                    "is_current": True,
+                }
+            )
+
+        try:
+            setattr(event, "_mem_chat_media_familiarity", entries)
+            setattr(
+                event,
+                "_mem_chat_media_alias_candidates",
+                [
+                    {
+                        "fingerprint": str(candidate.get("fingerprint") or ""),
+                        "caption": str(candidate.get("caption") or ""),
+                        "media_kind": str(candidate.get("media_kind") or "image"),
+                        "image_index": int(candidate.get("image_index") or 0),
+                    }
+                    for candidate in candidates
+                ],
+            )
+            setattr(event, "_mem_chat_media_alias_learning", alias_enabled)
+        except Exception:
+            pass
+
+        counts = ", ".join(str(e.get("seen_count") or 0) for e in entries)
+        kinds = ", ".join(str(e.get("media_kind") or "image") for e in entries)
+        logger.info(
+            f"[mem_chat] media familiarity scope={scope} "
+            f"counts=[{counts}] kinds=[{kinds}] "
+            f"aliases={sum(len(e.get('aliases') or []) for e in entries)} "
+            f"learned={len(learned)}"
+        )
+
     async def _startup_init(self):
+        try:
+            await self.scene_engine.restore_sessions()
+        except Exception as e:
+            logger.warning(f"[mem_chat] scene restore on startup failed: {e}")
         await self._purge_persona_vectors()
         await self._clean_colg_patch_knowledge()
         await self._check_and_update_knowledge()
@@ -1839,6 +2374,18 @@ class MemChat(Star):
                 gid = event.get_group_id()
                 if gid:
                     group = await event.get_group(gid)
+                    if group:
+                        try:
+                            member_count = int(getattr(group, "member_count", 0) or 0)
+                            members = getattr(group, "members", None) or []
+                            if member_count <= 0 and members:
+                                member_count = len(members)
+                            if member_count > 0:
+                                self.state.set_group_member_count(
+                                    str(gid), member_count
+                                )
+                        except Exception:
+                            pass
                     if group and getattr(group, "members", None):
                         self_id = str(event.get_self_id() or "")
                         current_name = None
@@ -1944,6 +2491,60 @@ class MemChat(Star):
             text_with_images = await self._fallback_text_with_images(event)
             image_urls = await self._fallback_extract_images(event)
 
+        familiarity_scope = str(
+            event.get_group_id() or event.get_sender_id() or ""
+        ).strip()
+        if image_urls:
+            try:
+                text_with_images = await self._ensure_image_captions(
+                    event,
+                    str(text_with_images or ""),
+                    image_urls,
+                    familiarity_scope,
+                )
+            except Exception as e:
+                logger.debug(f"[mem_chat] image caption enrichment failed: {e}")
+        try:
+            text_with_images = await self._append_recent_image_context(
+                event,
+                str(text_with_images or ""),
+                familiarity_scope,
+            )
+        except Exception as e:
+            logger.debug(f"[mem_chat] recent image context failed: {e}")
+
+        media_alias_enabled = bool(self.config.get("media_alias_enabled", True))
+        if image_urls and (
+            bool(self.config.get("media_familiarity_enabled", True))
+            or media_alias_enabled
+        ):
+            try:
+                await self._attach_media_familiarity_for_event(
+                    event,
+                    scope_id=familiarity_scope,
+                    message_id=str(msg_id or ""),
+                    text=str(text_with_images or ""),
+                    image_urls=image_urls,
+                )
+            except Exception as e:
+                logger.debug(f"[mem_chat] media familiarity failed: {e}")
+        elif media_alias_enabled:
+            # A quoted or immediately preceding image has no direct image_urls.
+            # Learn only explicit naming statements here; ambiguous wording is
+            # still left to the model's hidden alias-action decision.
+            try:
+                intent = extract_media_alias_intent(
+                    str(getattr(event, "message_str", "") or "")
+                )
+                if intent:
+                    await self.llm_client._apply_media_alias_action(
+                        event,
+                        action=str(intent.get("action") or "set"),
+                        alias=str(intent.get("alias") or ""),
+                    )
+            except Exception as e:
+                logger.debug(f"[mem_chat] quoted media alias learning failed: {e}")
+
         try:
             text_with_images = self._enrich_text_with_poke_details(
                 event, text_with_images
@@ -2048,7 +2649,9 @@ class MemChat(Star):
                     at_targets=at_targets,
                     at_all=at_all,
                     poke_meta=poke_meta,
+                    is_private=not bool(event.get_group_id()),
                 )
+                meta["is_directed"] = bool(is_at)
                 meta["msg_id"] = str(msg_id or "").strip()
                 meta["text"] = str(text_with_images or "")
                 try:
@@ -2079,13 +2682,25 @@ class MemChat(Star):
 
         # 4. Check Interrupt
         if self.state.is_processing(umo):
-            if is_at:
+            if is_at and not event.get_group_id():
                 self.state.set_interrupt(umo)
                 logger.debug(f"[mem_chat] Set interrupt for {umo} (is_at={is_at})")
 
         # 5. Check if Command (Ignore)
         if getattr(event, "is_command", False):
             return
+
+        # Private chat only: let the optional scene coordinator observe this
+        # turn. It cancels stale autonomous timers and, when a scene is already
+        # active, injects pacing/continuity guidance into this normal reply.
+        # Commands are ignored above so they cannot pause a running scene.
+        if not event.get_group_id():
+            try:
+                await self.scene_engine.note_private_message(
+                    umo, text_with_images, event
+                )
+            except Exception as e:
+                logger.warning(f"[mem_chat] scene observe failed for {umo}: {e}")
 
         # 6. Save to Memory
         gid = event.get_group_id() or event.get_sender_id()

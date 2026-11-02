@@ -3,10 +3,8 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import time
 from collections import defaultdict
-from pathlib import Path
 
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import At, AtAll, Face, Plain, Poke, Reply
@@ -25,6 +23,7 @@ logger = logging.getLogger("astrbot")
 async def _empty_recall() -> list[tuple[str, float]]:
     """Awaitable placeholder so gather keeps a fixed shape when a recall is off."""
     return []
+
 
 class Scheduler:
     def __init__(
@@ -47,6 +46,7 @@ class Scheduler:
         self.active_queues = set()
         self.cycle_timers = {}  # umo -> asyncio.TimerHandle (or Task)
         self._last_send_ts = {}
+        self._queued_group_at: set[str] = set()
         self._deferred_focus = {}  # umo -> bool
         self._admin_protocols_cache: str | None = None
         self._affinity_decay_last_ts: dict[str, float] = {}
@@ -58,14 +58,20 @@ class Scheduler:
     ):
         """
         Trigger a view cycle.
-        - AT: Wait 1-3s, then submit task.
+        - Group AT: Coalesce messages for two seconds without extending the timer.
+        - Private AT: Keep the existing three-to-five-second debounce.
         - FOCUS: Wait X seconds (dynamic), then submit task.
         - READ_AIR: Wait X seconds (config), then submit task.
         """
 
-        if cycle_type == "read_air" and not bool(self._get_conf("read_air_enable", True)):
+        if cycle_type == "read_air" and not bool(
+            self._get_conf("read_air_enable", True)
+        ):
             return
 
+        group_batch = bool(event and event.get_group_id())
+        if cycle_type == "at" and group_batch and umo in self._queued_group_at:
+            return
         curr_type = self.state.get_cycle_task_type(umo)
 
         # Priority mapping: smaller is higher
@@ -74,7 +80,9 @@ class Scheduler:
         curr_prio = priority.get(curr_type, 99)  # 99 if None
 
         if cycle_type != "at" and (
-            self.state.is_processing(umo) or not self.task_queues[umo].empty()
+            umo in self.active_queues
+            or self.state.is_processing(umo)
+            or not self.task_queues[umo].empty()
         ):
             logger.debug(
                 f"[mem_chat] Skip triggering {cycle_type} for {umo} as it is currently busy."
@@ -84,7 +92,7 @@ class Scheduler:
             return
         if self.state.is_processing(umo) and cycle_type == "at":
             logger.info(
-                f"[mem_chat] AT message received while processing for {umo}. Proceeding to trigger AT cycle (Interrupt flag expected)."
+                f"[mem_chat] AT message received while processing for {umo}. Proceeding to trigger AT cycle (next batch)."
             )
 
         should_start = False
@@ -103,7 +111,10 @@ class Scheduler:
                     pass
         elif new_prio == curr_prio:
             if cycle_type == "at":
-                # AT: Always restart (Debounce)
+                # Keep the first group deadline so repeated mentions cannot starve it.
+                timer = self.cycle_timers.get(umo)
+                if group_batch and timer and not timer.done():
+                    return
                 should_start = True
                 if umo in self.cycle_timers:
                     try:
@@ -141,8 +152,7 @@ class Scheduler:
         if cycle_type == "at":
             # Start At Cycle
             self.state.set_cycle_task_type(umo, "at")
-            # Random delay 3-5s
-            delay = 3.0 + self.random.random() * 2.0
+            delay = 2.0 if group_batch else 3.0 + self.random.random() * 2.0
             self.cycle_timers[umo] = asyncio.create_task(
                 self._cycle_wait_and_submit(umo, "at", delay, event, image_urls)
             )
@@ -152,7 +162,9 @@ class Scheduler:
             # Start Focus Cycle
             self.state.set_cycle_task_type(umo, "focus")
             # Use dynamic delay based on @at counts, baseline is focus_mode_cycle
-            cycle_min, cycle_max, _cycle_step_max, base_delay = self._focus_cycle_bounds()
+            cycle_min, cycle_max, _cycle_step_max, base_delay = (
+                self._focus_cycle_bounds(umo)
+            )
             cycle_delay = self.state.get_focus_delay(umo, default=base_delay)
             cycle_delay = self._clamp_float(float(cycle_delay), cycle_min, cycle_max)
             self.state.set_focus_delay(umo, cycle_delay, min_val=cycle_min)
@@ -161,7 +173,9 @@ class Scheduler:
             except Exception:
                 last_send_ts = 0.0
             if last_send_ts > 0:
-                cycle_delay = max(0.0, (last_send_ts + float(cycle_delay)) - time.time())
+                cycle_delay = max(
+                    0.0, (last_send_ts + float(cycle_delay)) - time.time()
+                )
             self.cycle_timers[umo] = asyncio.create_task(
                 self._cycle_wait_and_submit(
                     umo, "focus", float(cycle_delay), event, image_urls
@@ -174,9 +188,7 @@ class Scheduler:
         elif cycle_type == "read_air":
             # Start Read Air Cycle
             self.state.set_cycle_task_type(umo, "read_air")
-            cycle_delay = self._get_conf("heartbeat_cycle", 60)
-            if cycle_delay < 5:
-                cycle_delay = 5
+            cycle_delay = self._read_air_wait_seconds(umo)
             try:
                 if not self.state.get_heartbeat_start(umo):
                     self.state.set_heartbeat_start(umo)
@@ -201,7 +213,7 @@ class Scheduler:
             # LOGIC CHECKS BEFORE SUBMISSION
             if task_type == "read_air":
                 # Check message counts
-                min_msgs = int(self._get_conf("decision_msg_count_min", 1))
+                min_msgs = self._read_air_min_messages(umo)
                 max_msgs = int(self._get_conf("decision_msg_count_max", 100))
                 if max_msgs < min_msgs:
                     max_msgs = min_msgs
@@ -230,7 +242,9 @@ class Scheduler:
                         f"[mem_chat] Focus mode expired for {umo}. Switching to Read Air."
                     )
                     self.state.set_cycle_task_type(umo, None)
-                    cycle_min, cycle_max, _cycle_step_max, base_delay = self._focus_cycle_bounds()
+                    cycle_min, cycle_max, _cycle_step_max, base_delay = (
+                        self._focus_cycle_bounds(umo)
+                    )
                     base_delay = self._clamp_float(base_delay, cycle_min, cycle_max)
                     self.state.reset_focus_delay(
                         umo, default=base_delay
@@ -380,12 +394,94 @@ class Scheduler:
             return target
         return current + (step_max if delta > 0 else -step_max)
 
-    def _focus_cycle_bounds(self) -> tuple[float, float, float, float]:
+    @staticmethod
+    def _group_id_from_umo(umo: str) -> str:
+        raw = str(umo or "").strip()
+        if not raw or "GroupMessage" not in raw:
+            return ""
+        parts = raw.split(":")
+        return str(parts[2] or "").strip() if len(parts) >= 3 else ""
+
+    def _group_member_count_for_umo(self, umo: str) -> int:
+        gid = self._group_id_from_umo(umo)
+        return self.state.get_group_member_count(gid) if gid else 0
+
+    def _large_group_multiplier(self, umo: str) -> float:
+        if not bool(self._get_conf("large_group_frequency_enabled", True)):
+            return 1.0
+        count = self._group_member_count_for_umo(umo)
+        threshold = max(
+            1,
+            int(
+                self._to_float(
+                    self._get_conf("large_group_member_threshold", 100), 100.0
+                )
+            ),
+        )
+        if count < threshold:
+            return 1.0
+        multiplier = self._to_float(
+            self._get_conf("large_group_heartbeat_multiplier", 1.8), 1.8
+        )
+        return self._clamp_float(multiplier, 1.0, 5.0)
+
+    def _read_air_wait_seconds(self, umo: str) -> float:
+        try:
+            base = float(self._get_conf("heartbeat_cycle", 60) or 60)
+        except Exception:
+            base = 60.0
+        if base < 5:
+            base = 5.0
+        return base * self._large_group_multiplier(umo)
+
+    def _read_air_min_messages(self, umo: str) -> int:
+        try:
+            base = int(self._get_conf("decision_msg_count_min", 1) or 1)
+        except Exception:
+            base = 1
+        bonus = 0
+        if self._large_group_multiplier(umo) > 1.0:
+            bonus = max(
+                0,
+                int(
+                    self._to_float(
+                        self._get_conf("large_group_min_message_bonus", 5), 5.0
+                    )
+                ),
+            )
+        return max(1, base + bonus)
+
+    def _cap_focus_duration(self, umo: str, duration: int) -> int:
+        if self._large_group_multiplier(umo) <= 1.0:
+            return max(1, int(duration))
+        cap = int(
+            self._to_float(
+                self._get_conf("large_group_focus_duration_cap_sec", 45), 45.0
+            )
+        )
+        if cap > 0:
+            return max(1, min(int(duration), cap))
+        return max(1, int(duration))
+
+    def _large_group_decision_note(self, umo: str) -> str:
+        if self._large_group_multiplier(umo) <= 1.0:
+            return ""
+        return (
+            "【大群发言频率约束】当前群人数较多。只有话题自然可接、你的回复有明确信息增量，"
+            "或确实能推进对话时才回复；多人已经说过、只是附和/复述、插不上话时输出 no_reply。"
+            "不要为了刷存在感而发言。"
+        )
+
+    def _focus_cycle_bounds(
+        self, umo: str | None = None
+    ) -> tuple[float, float, float, float]:
         base = self._to_float(self._get_conf("focus_mode_cycle", 15), 15.0)
         if base < 1:
             base = 1.0
         min_v = self._to_float(
-            self._get_conf("focus_cycle_min_sec", self._get_conf("focus_mode_cycle_min", 10)),
+            self._get_conf(
+                "focus_cycle_min_sec", self._get_conf("focus_mode_cycle_min", 10)
+            ),
             min(10.0, base),
         )
         max_v = self._to_float(
@@ -403,13 +499,20 @@ class Scheduler:
         if step_max <= 0:
             step_max = max_v - min_v
         base = self._clamp_float(base, min_v, max_v)
+        if umo:
+            multiplier = self._large_group_multiplier(umo)
+            if multiplier > 1.0:
+                return (
+                    min_v * multiplier,
+                    max_v * multiplier,
+                    step_max * multiplier,
+                    base * multiplier,
+                )
         return min_v, max_v, step_max, base
 
     def _focus_duration_bounds(self) -> tuple[int, int, int, int]:
         base = int(self._to_float(self._get_conf("focus_duration_sec", 100), 100.0))
-        min_v = int(
-            self._to_float(self._get_conf("focus_duration_min_sec", 60), 60.0)
-        )
+        min_v = int(self._to_float(self._get_conf("focus_duration_min_sec", 60), 60.0))
         max_v = int(
             self._to_float(self._get_conf("focus_duration_max_sec", 900), 900.0)
         )
@@ -481,16 +584,12 @@ class Scheduler:
         if not isinstance(meta, dict):
             return "群聊"
         t = str(
-            meta.get("inferred_target_name")
-            or meta.get("explicit_target_name")
-            or ""
+            meta.get("inferred_target_name") or meta.get("explicit_target_name") or ""
         ).strip()
         if t:
             return t
         t_type = str(
-            meta.get("inferred_target_type")
-            or meta.get("explicit_target_type")
-            or ""
+            meta.get("inferred_target_type") or meta.get("explicit_target_type") or ""
         ).strip()
         if t_type == "bot":
             return "机器人"
@@ -513,14 +612,20 @@ class Scheduler:
         explicit_type = str(m.get("explicit_target_type") or "group").strip()
         explicit_name = str(m.get("explicit_target_name") or "").strip()
         explicit_id = str(m.get("explicit_target_id") or "").strip()
-        inferred_type = str(m.get("inferred_target_type") or explicit_type or "group").strip()
-        inferred_name = str(m.get("inferred_target_name") or explicit_name or "").strip()
+        inferred_type = str(
+            m.get("inferred_target_type") or explicit_type or "group"
+        ).strip()
+        inferred_name = str(
+            m.get("inferred_target_name") or explicit_name or ""
+        ).strip()
         inferred_id = str(m.get("inferred_target_id") or explicit_id or "").strip()
         reason = str(m.get("target_reason") or "").strip()
         confidence = str(m.get("target_confidence") or "low").strip()
         reply_sender_name = str(m.get("reply_to_sender_name") or "").strip()
         reply_sender_id = str(m.get("reply_to_sender_id") or "").strip()
-        at_targets = m.get("at_targets") if isinstance(m.get("at_targets"), list) else []
+        at_targets = (
+            m.get("at_targets") if isinstance(m.get("at_targets"), list) else []
+        )
         poke_operator_name = str(m.get("poke_operator_name") or "").strip()
         poke_operator_id = str(m.get("poke_operator_id") or "").strip()
         poke_target_name = str(m.get("poke_target_name") or "").strip()
@@ -540,16 +645,20 @@ class Scheduler:
             return "群聊"
 
         lines = ["【对话对象判断】"]
-        current_sender = format_sender(
-            sender_name or "User", sender_id, sender_tags
-        ) or "User"
+        current_sender = (
+            format_sender(sender_name or "User", sender_id, sender_tags) or "User"
+        )
         lines.append(f"当前发言人: {current_sender}")
-        bot_label = f"{self_name}/{self_id}" if self_name and self_id else (self_id or "未知")
+        bot_label = (
+            f"{self_name}/{self_id}" if self_name and self_id else (self_id or "未知")
+        )
         lines.append(f"机器人ID: {bot_label}")
         lines.append("")
         lines.append("显式信号:")
         if reply_sender_id or reply_sender_name:
-            lines.append(f"- 回复对象: {_fmt_target('user', reply_sender_name, reply_sender_id)}")
+            lines.append(
+                f"- 回复对象: {_fmt_target('user', reply_sender_name, reply_sender_id)}"
+            )
         else:
             lines.append("- 回复对象: 无")
         if at_targets:
@@ -577,11 +686,17 @@ class Scheduler:
         else:
             lines.append("- 戳一戳: 无")
         lines.append(f"- @全体: {'是' if explicit_type == 'group_all' else '否'}")
-        lines.append(f"- 是否明确点名机器人: {'是' if explicit_type == 'bot' else '否'}")
+        lines.append(
+            f"- 是否明确点名机器人: {'是' if explicit_type == 'bot' else '否'}"
+        )
         lines.append("")
         lines.append("系统判断:")
-        lines.append(f"- 这句话最可能是在对: {_fmt_target(inferred_type, inferred_name, inferred_id)}")
-        lines.append(f"- 判断类型: {reason or inferred_type or explicit_type or 'unknown'}")
+        lines.append(
+            f"- 这句话最可能是在对: {_fmt_target(inferred_type, inferred_name, inferred_id)}"
+        )
+        lines.append(
+            f"- 判断类型: {reason or inferred_type or explicit_type or 'unknown'}"
+        )
         lines.append(f"- 置信度: {confidence or 'low'}")
         return "\n".join(lines).strip()
 
@@ -733,7 +848,9 @@ class Scheduler:
         )
         self._affinity_decay_last_ts[gid] = now
         if changed > 0:
-            logger.info(f"[mem_chat] Affinity decay applied for group={gid}, changed={changed}.")
+            logger.info(
+                f"[mem_chat] Affinity decay applied for group={gid}, changed={changed}."
+            )
 
     def _maybe_update_affinity_from_mood(
         self,
@@ -750,7 +867,7 @@ class Scheduler:
         uid = str(sender_id or "").strip()
         if not gid or not uid:
             return
-        require_at = bool(self._get_conf("affinity_update_require_at", True))
+        require_at = bool(self._get_conf("affinity_update_require_at", False))
         targets_bot = self._event_targets_bot(umo, event)
         poke_hit = self._event_pokes_bot(umo, event)
         if require_at and not (task_type == "at" or targets_bot):
@@ -786,7 +903,9 @@ class Scheduler:
                 llm_delta = 0.0
                 llm_reason = "poke_only"
             else:
-                use_fallback = bool(self._get_conf("affinity_llm_fallback_to_mood", False))
+                use_fallback = bool(
+                    self._get_conf("affinity_llm_fallback_to_mood", False)
+                )
                 if not use_fallback:
                     logger.info(
                         f"[mem_chat] Affinity skip gid={gid} uid={uid}: missing llm affinity signal."
@@ -816,10 +935,12 @@ class Scheduler:
             except Exception:
                 window = 8
             try:
-                start_factor = float(self._get_conf("affinity_new_user_factor_start", 0.4))
+                start_factor = float(
+                    self._get_conf("affinity_new_user_factor_start", 0.8)
+                )
                 end_factor = float(self._get_conf("affinity_new_user_factor_end", 1.0))
             except Exception:
-                start_factor, end_factor = 0.4, 1.0
+                start_factor, end_factor = 0.8, 1.0
             if window > 0 and event_count < window:
                 progress = float(event_count) / float(window)
                 newcomer_factor = start_factor + (end_factor - start_factor) * progress
@@ -833,7 +954,9 @@ class Scheduler:
                     f"(new_user_count={event_count}/{window})"
                 )
 
-        poke_preapply = bool(self._get_conf("affinity_poke_preapply_before_prompt", True))
+        poke_preapply = bool(
+            self._get_conf("affinity_poke_preapply_before_prompt", True)
+        )
         # Poke is treated as a strong positive interaction.
         if poke_hit and not poke_preapply:
             try:
@@ -888,6 +1011,29 @@ class Scheduler:
             logger.info(
                 f"[mem_chat] Affinity updated gid={gid} uid={uid} delta={delta:.2f} reason={reason[:60]}"
             )
+
+    async def _notify_scene_after_turn(
+        self,
+        umo: str,
+        event: AstrMessageEvent | None,
+        task_type: str,
+        *,
+        sent: bool,
+        replied: bool,
+    ):
+        """Give the private scene coordinator one completed turn to observe."""
+        try:
+            scene_engine = getattr(self.plugin, "scene_engine", None)
+            if scene_engine is not None:
+                await scene_engine.on_scheduler_reply_completed(
+                    umo,
+                    event,
+                    str(task_type or ""),
+                    sent=bool(sent),
+                    replied=bool(replied),
+                )
+        except Exception as e:
+            logger.warning(f"[mem_chat] scene post-reply hook failed for {umo}: {e}")
 
     def _load_admin_protocols_text(self) -> str:
         if isinstance(self._admin_protocols_cache, str) and self._admin_protocols_cache:
@@ -962,7 +1108,9 @@ class Scheduler:
         timeout_sec = self._get_task_timeout_sec(getattr(task, "task_type", ""))
         if timeout_sec <= 0:
             return 0.0
-        elapsed = time.time() - float(getattr(task, "created_at", time.time()) or time.time())
+        elapsed = time.time() - float(
+            getattr(task, "created_at", time.time()) or time.time()
+        )
         return max(0.0, timeout_sec - elapsed)
 
     async def _await_task_stage(self, task: ReplyTask, stage: str, awaitable):
@@ -996,6 +1144,10 @@ class Scheduler:
             return text
 
     async def add_task(self, task: ReplyTask):
+        if task.task_type == "at" and task.event and task.event.get_group_id():
+            if task.umo in self._queued_group_at:
+                return
+            self._queued_group_at.add(task.umo)
         await self.task_queues[task.umo].put(task)
         if task.umo not in self.active_queues:
             asyncio.create_task(self._process_reply_queue(task.umo))
@@ -1013,6 +1165,9 @@ class Scheduler:
                     break
 
                 task: ReplyTask = await queue.get()
+                if task.task_type == "at":
+                    self._queued_group_at.discard(umo)
+                group_batch = bool(task.event and task.event.get_group_id())
                 try:
                     # Check timeout
                     timeout_sec = self._get_task_timeout_sec(task.task_type)
@@ -1036,6 +1191,8 @@ class Scheduler:
                         min_interval = float(min_interval or 0)
                     except Exception:
                         min_interval = 0.0
+                    if group_batch and task.task_type == "at":
+                        min_interval = 0.0
                     if min_interval > 0:
                         prev_ts = float(self._last_send_ts.get(umo, 0.0) or 0.0)
                         if prev_ts > 0:
@@ -1051,6 +1208,15 @@ class Scheduler:
                                     )
                                     continue
 
+                    # Freeze the cycle before any awaited context or model work.
+                    cycle_cutoff_ts = time.time()
+                    pending_snapshot = self.state.get_pending_messages(umo)
+                    pending_snapshot = [
+                        row
+                        for row in pending_snapshot
+                        if row[4] <= cycle_cutoff_ts
+                        and not self.state.is_no_reply_message_id(umo, row[0])
+                    ]
                     # Re-fetch context at execution time
                     history_count = int(self._get_conf("history_message_count", 12))
                     history_msgs = await self.get_recent_history(
@@ -1072,22 +1238,31 @@ class Scheduler:
 
                         # Fetch pending messages to save and include in context
                         # Consuming pending messages ensures Heartbeat doesn't process them again
-                        raw_pending = self.state.get_pending_messages(umo)
-                        raw_pending = [
-                            m
-                            for m in (raw_pending or [])
-                            if not self.state.is_no_reply_message_id(
-                                umo, m[0] if m else None
-                            )
-                        ]
+                        raw_pending = list(pending_snapshot)
                         max_at_msgs = int(self._get_conf("at_pending_max_msgs", 30))
+                        if group_batch and not raw_pending:
+                            continue
                         if max_at_msgs > 0 and len(raw_pending) > max_at_msgs:
-                            try:
-                                cutoff_ts = raw_pending[-max_at_msgs][4]
-                                raw_pending = self.state.prune_pending_messages(
-                                    umo, cutoff_ts=cutoff_ts, keep_last=max_at_msgs
+                            if group_batch:
+                                # Keep directed messages even when context exceeds the soft limit.
+                                head = set(raw_pending[:max_at_msgs])
+                                event_mid = str(
+                                    getattr(task.event.message_obj, "message_id", "")
                                 )
-                            except Exception:
+                                raw_pending = [
+                                    row
+                                    for row in raw_pending
+                                    if row in head
+                                    or str(row[0]) == event_mid
+                                    or (
+                                        self.state.get_message_meta(umo, row[0]) or {}
+                                    ).get("is_directed")
+                                    or (
+                                        self.state.get_message_meta(umo, row[0]) or {}
+                                    ).get("explicit_target_type")
+                                    == "bot"
+                                ]
+                            else:
                                 raw_pending = raw_pending[-max_at_msgs:]
                         user_msgs_to_save = []
                         quote_candidates = []
@@ -1124,37 +1299,40 @@ class Scheduler:
                             from .ref_context import build_ref_context
 
                             sender_tags = load_sender_tags(
-                                task.event.get_group_id()
-                                or task.event.get_sender_id()
+                                task.event.get_group_id() or task.event.get_sender_id()
                             )
                             ref_window = int(self._get_conf("ref_context_window", 0))
                             if ref_window <= 0:
                                 ref_window = max_at_msgs
+                            if group_batch:
+                                ref_window = max(ref_window, len(raw_pending))
                             include_referenced = bool(
                                 self._get_conf("ref_context_include_referenced", True)
                             )
-                            pend_lines, quote_candidates, index_to_id = build_ref_context(
-                                raw_pending if raw_pending else [],
-                                None,
-                                None,
-                                get_reply_target=lambda mid: self.state.get_reply_target(
-                                    umo, mid
-                                ),
-                                get_reply_summary=lambda rid: self.state.get_reply_summary(
-                                    umo, rid
-                                ),
-                                get_message_meta=lambda mid: self.state.get_message_meta(
-                                    umo, mid
-                                ),
-                                max_items=ref_window,
-                                include_referenced=include_referenced,
-                                time_gap_min_minutes=int(
-                                    self._get_conf("history_time_gap_minutes", 15)
-                                ),
-                                time_marker_every_n_messages=int(
-                                    self._get_conf("history_time_marker_every_n", 4)
-                                ),
-                                sender_tags=sender_tags,
+                            pend_lines, quote_candidates, index_to_id = (
+                                build_ref_context(
+                                    raw_pending if raw_pending else [],
+                                    None,
+                                    None,
+                                    get_reply_target=lambda mid: (
+                                        self.state.get_reply_target(umo, mid)
+                                    ),
+                                    get_reply_summary=lambda rid: (
+                                        self.state.get_reply_summary(umo, rid)
+                                    ),
+                                    get_message_meta=lambda mid: (
+                                        self.state.get_message_meta(umo, mid)
+                                    ),
+                                    max_items=ref_window,
+                                    include_referenced=include_referenced,
+                                    time_gap_min_minutes=int(
+                                        self._get_conf("history_time_gap_minutes", 15)
+                                    ),
+                                    time_marker_every_n_messages=int(
+                                        self._get_conf("history_time_marker_every_n", 4)
+                                    ),
+                                    sender_tags=sender_tags,
+                                )
                             )
                         except Exception:
                             pend_lines = []
@@ -1166,13 +1344,28 @@ class Scheduler:
                         sender_id = task.event.get_sender_id()
                         sender_name = task.event.get_sender_name()
 
-                        # Use latest message from pending if available; AT event may be older than newest pending.
+                        # The trigger anchors retrieval; the full window controls group replies.
                         last_msg = msg_text
                         reply_sender_name = sender_name
                         reply_sender_id = sender_id
                         latest_mid = None
+                        anchor_mid = str(
+                            getattr(task.event.message_obj, "message_id", "")
+                        )
+                        anchor = next(
+                            (
+                                row
+                                for row in user_msgs_to_save
+                                if str(row.get("_msg_id")) == anchor_mid
+                            ),
+                            None,
+                        )
                         if user_msgs_to_save:
-                            tail = user_msgs_to_save[-1]
+                            tail = (
+                                anchor
+                                if group_batch and anchor
+                                else user_msgs_to_save[-1]
+                            )
                             last_msg = tail.get("content") or msg_text
                             reply_sender_name = (
                                 tail.get("sender_name") or sender_name or "User"
@@ -1192,36 +1385,37 @@ class Scheduler:
                             pass
 
                         # Re-build memory context using latest pending message
-                        memory_context, admin_protocols_text = (
-                            await self._await_task_stage(
-                                task,
-                                "build_memory_context",
-                                self.build_memory_context(
-                                    last_msg,
-                                    gid,
-                                    reply_sender_name,
-                                    history_msgs,
-                                    reply_sender_id,
-                                    conversation,
-                                    is_group=bool(task.event.get_group_id()),
-                                    task_type="at",
-                                    self_id=(
-                                        task.event.get_self_id()
-                                        if task.event
-                                        else ""
-                                    ),
-                                    recent_participants=[
-                                        (str(_sid), str(_s or "User"))
-                                        for (_mid, _t, _s, _sid, _ts) in (raw_pending or [])
-                                        if _sid
-                                    ],
+                        (
+                            memory_context,
+                            admin_protocols_text,
+                        ) = await self._await_task_stage(
+                            task,
+                            "build_memory_context",
+                            self.build_memory_context(
+                                last_msg,
+                                gid,
+                                reply_sender_name,
+                                history_msgs,
+                                reply_sender_id,
+                                conversation,
+                                is_group=bool(task.event.get_group_id()),
+                                task_type="at",
+                                self_id=(
+                                    task.event.get_self_id() if task.event else ""
                                 ),
-                            )
+                                recent_participants=[
+                                    (str(_sid), str(_s or "User"))
+                                    for (_mid, _t, _s, _sid, _ts) in (raw_pending or [])
+                                    if _sid
+                                ],
+                            ),
                         )
 
                         cur_mid = None
                         try:
-                            cur_mid = getattr(task.event.message_obj, "message_id", None)
+                            cur_mid = getattr(
+                                task.event.message_obj, "message_id", None
+                            )
                         except Exception:
                             cur_mid = None
                         cur_mid_str = str(latest_mid or cur_mid or "").strip()
@@ -1251,6 +1445,7 @@ class Scheduler:
                             history_lines=pend_lines,
                             mood_text=self.state.get_last_mood(umo),
                             target_block=target_block,
+                            batch_mode=group_batch,
                         )
 
                         instruction = ""
@@ -1286,7 +1481,18 @@ class Scheduler:
                         finally:
                             self.state.set_processing(umo, False)
 
-                        if replied:
+                        send_ok = bool(
+                            getattr(task.event, "_mem_chat_last_send_ok", False)
+                        )
+                        sent = bool(replied and send_ok)
+                        await self._notify_scene_after_turn(
+                            umo,
+                            task.event,
+                            "at",
+                            sent=sent,
+                            replied=bool(replied),
+                        )
+                        if sent:
                             self._maybe_update_affinity_from_mood(
                                 umo=umo,
                                 task_type="at",
@@ -1296,8 +1502,12 @@ class Scheduler:
                                 history_msgs=history_msgs,
                             )
 
-                        dur_min, dur_max, dur_step_max, dur_base = self._focus_duration_bounds()
-                        cycle_min, _cycle_max, _cycle_step_max, _base_delay = self._focus_cycle_bounds()
+                        dur_min, dur_max, dur_step_max, dur_base = (
+                            self._focus_duration_bounds()
+                        )
+                        cycle_min, _cycle_max, _cycle_step_max, _base_delay = (
+                            self._focus_cycle_bounds()
+                        )
                         remaining = float(self.state.get_focus_remaining_sec(umo))
                         at_extend_base = max(1, int(cycle_min or 1))
                         at_extend_cap = max(1, int(dur_step_max))
@@ -1308,25 +1518,34 @@ class Scheduler:
                         focus_at_extend = int(
                             max(
                                 1,
-                                min(float(at_extend_base), float(at_extend_cap)) * decay,
+                                min(float(at_extend_base), float(at_extend_cap))
+                                * decay,
                             )
                         )
-                        remaining_int = int(remaining) + (1 if (remaining - int(remaining)) > 0 else 0)
-                        focus_duration = max(int(dur_base), remaining_int) + focus_at_extend
+                        remaining_int = int(remaining) + (
+                            1 if (remaining - int(remaining)) > 0 else 0
+                        )
+                        focus_duration = (
+                            max(int(dur_base), remaining_int) + focus_at_extend
+                        )
                         if focus_duration < dur_min:
                             focus_duration = dur_min
                         elif focus_duration > dur_max:
                             focus_duration = dur_max
-                        self.state.set_focus(umo, focus_duration)
+                        if replied and send_ok:
+                            self.state.set_focus(umo, focus_duration)
                         if replied:
-                            if consumed_count > 0:
-                                self.state.clear_pending_first_n(umo, consumed_count)
-                            send_ts = time.time()
-                            self._last_send_ts[umo] = send_ts
-                            self.state.clear_pending_up_to(umo, send_ts)
-                            logger.info(
-                                f"[mem_chat] AT phase finished for {umo}. Refreshed Focus Mode (Duration: {focus_duration}s, +{focus_at_extend}s)."
-                            )
+                            consume_ts = time.time()
+                            self.state.consume_pending_messages(umo, raw_pending)
+                            if send_ok:
+                                self._last_send_ts[umo] = consume_ts
+                                logger.info(
+                                    f"[mem_chat] AT phase finished for {umo}. Refreshed Focus Mode (Duration: {focus_duration}s, +{focus_at_extend}s)."
+                                )
+                            else:
+                                logger.info(
+                                    f"[mem_chat] AT phase consumed messages without sending for {umo}; Focus Mode not refreshed."
+                                )
                         else:
                             logger.info(
                                 f"[mem_chat] AT phase failed/interrupted for {umo}. Focus Mode still active. Messages retained in pending."
@@ -1337,48 +1556,46 @@ class Scheduler:
                         deferred_focus = self._deferred_focus.pop(umo, False)
                         if replied and self.state.is_in_focus(umo):
                             await self.trigger_view_cycle(umo, "focus", task.event, [])
-                        elif (
-                            deferred_focus
-                            and self.state.is_in_focus(umo)
-                        ):
+                        elif deferred_focus and self.state.is_in_focus(umo):
                             await self.trigger_view_cycle(umo, "focus", task.event, [])
 
                     elif task.task_type == "focus" or task.task_type == "read_air":
-                        raw_pending = self.state.get_pending_messages(umo)
-                        raw_pending = [
-                            m
-                            for m in (raw_pending or [])
-                            if not self.state.is_no_reply_message_id(
-                                umo, m[0] if m else None
-                            )
-                        ]
+                        raw_pending = list(pending_snapshot)
                         if not raw_pending:
                             logger.info(
                                 f"[mem_chat] {task.task_type} task found no pending messages for {umo}. Skipping."
                             )
-                            self.state.set_last_cycle_cutoff(umo, float(task.created_at or time.time()))
+                            self.state.set_last_cycle_cutoff(
+                                umo, float(task.created_at or time.time())
+                            )
                             continue
-                        cycle_cutoff_ts = float(task.created_at or time.time())
-                        last_cycle_cutoff = float(self.state.get_last_cycle_cutoff(umo) or 0.0)
-                        raw_pending = [
-                            m
-                            for m in raw_pending
-                            if float(m[4] or 0.0) > last_cycle_cutoff
-                            and float(m[4] or 0.0) <= cycle_cutoff_ts
-                        ]
+                        # Pending rows are authoritative, including retained failed batches.
                         if not raw_pending:
                             logger.info(
                                 f"[mem_chat] {task.task_type} task has no new pending window for {umo}. Skipping."
                             )
                             self.state.set_last_cycle_cutoff(umo, cycle_cutoff_ts)
-                            self.state.clear_pending_up_to(umo, cycle_cutoff_ts)
+                            self.state.consume_pending_messages(umo, raw_pending)
                             continue
                         now_ts = time.time()
                         stale_sec_key = f"stale_pending_max_age_sec_{task.task_type}"
+                        stale_default = 180.0
+                        if task.task_type == "read_air":
+                            # The read-air cycle itself may wait for the full
+                            # heartbeat interval. Keep one minute of margin so
+                            # a healthy queued message is not declared stale at
+                            # the exact moment its task starts.
+                            try:
+                                heartbeat = float(self._get_conf("heartbeat_cycle", 60))
+                                stale_default = max(180.0, heartbeat + 60.0)
+                            except Exception:
+                                pass
                         stale_sec = float(
                             self._get_conf(
                                 stale_sec_key,
-                                self._get_conf("stale_pending_max_age_sec", 180),
+                                self._get_conf(
+                                    "stale_pending_max_age_sec", stale_default
+                                ),
                             )
                         )
                         if stale_sec > 0:
@@ -1387,24 +1604,19 @@ class Scheduler:
                                 logger.info(
                                     f"[mem_chat] {task.task_type} pending messages are stale for {umo}. Dropping."
                                 )
-                                self.state.clear_pending_up_to(umo, cycle_cutoff_ts)
+                                self.state.consume_pending_messages(umo, raw_pending)
                                 self.state.set_last_cycle_cutoff(umo, cycle_cutoff_ts)
                                 self.state.set_last_processed(umo, now_ts)
                                 continue
-                            try:
-                                raw_pending = self.state.prune_pending_messages(
-                                    umo, cutoff_ts=cutoff, keep_last=1
-                                )
-                            except Exception:
-                                raw_pending = [
-                                    m for m in raw_pending if m[4] >= cutoff
-                                ] or raw_pending[-1:]
+                            raw_pending = [
+                                m for m in raw_pending if m[4] >= cutoff
+                            ] or raw_pending[-1:]
                             if not raw_pending:
                                 logger.info(
                                     f"[mem_chat] {task.task_type} task has no pending messages after stale pruning for {umo}. Skipping."
                                 )
                                 self.state.set_last_cycle_cutoff(umo, cycle_cutoff_ts)
-                                self.state.clear_pending_up_to(umo, cycle_cutoff_ts)
+                                self.state.consume_pending_messages(umo, raw_pending)
                                 continue
                         if task.task_type == "read_air":
                             max_msgs = int(self._get_conf("decision_msg_count_max", 23))
@@ -1415,15 +1627,7 @@ class Scheduler:
                                 self._get_conf("focus_pending_max_msgs", 25)
                             )
                             if max_focus_msgs > 0 and len(raw_pending) > max_focus_msgs:
-                                try:
-                                    cutoff_ts = raw_pending[-max_focus_msgs][4]
-                                    raw_pending = self.state.prune_pending_messages(
-                                        umo,
-                                        cutoff_ts=cutoff_ts,
-                                        keep_last=max_focus_msgs,
-                                    )
-                                except Exception:
-                                    raw_pending = raw_pending[-max_focus_msgs:]
+                                raw_pending = raw_pending[:max_focus_msgs]
 
                         # Guard: For READ_AIR, skip if pending contains AT message (交给 AT 任务处理)。
                         # 对于 FOCUS，允许在专注期间处理历史中带 @ 的消息。
@@ -1443,7 +1647,9 @@ class Scheduler:
                                         logger.info(
                                             f"[mem_chat] {task.task_type} pending contains AT message. Skipping to avoid conflict with AT task."
                                         )
-                                        self.state.set_last_cycle_cutoff(umo, cycle_cutoff_ts)
+                                        self.state.set_last_cycle_cutoff(
+                                            umo, cycle_cutoff_ts
+                                        )
                                         continue
                             except Exception as e:
                                 logger.error(
@@ -1464,25 +1670,12 @@ class Scheduler:
                                     f"[mem_chat] {task.task_type} pending contains only assistant messages. Skipping."
                                 )
                                 # Clear to avoid repeated triggering
-                                self.state.clear_pending_up_to(umo, cycle_cutoff_ts)
+                                self.state.consume_pending_messages(umo, raw_pending)
                                 self.state.set_last_cycle_cutoff(umo, cycle_cutoff_ts)
                                 self.state.set_last_processed(umo, time.time())
                                 continue
                         except Exception:
                             pass
-
-                        if task.task_type == "focus":
-                            try:
-                                last_send_ts = float(self._last_send_ts.get(umo, 0.0) or 0.0)
-                            except Exception:
-                                last_send_ts = 0.0
-                            if last_send_ts > 0 and raw_pending[-1][4] < last_send_ts:
-                                self.state.clear_pending_up_to(umo, last_send_ts)
-                                self.state.set_last_cycle_cutoff(
-                                    umo, max(cycle_cutoff_ts, last_send_ts)
-                                )
-                                self.state.set_last_processed(umo, time.time())
-                                continue
 
                         # Consume pending
                         pend_lines = [
@@ -1525,7 +1718,9 @@ class Scheduler:
                         gid = umo.split(":")[-1] if ":" in umo else ""  # Approximate
                         sender_tags = load_sender_tags(gid)
 
-                        reply_line = f"{format_sender(sname, sid, sender_tags)}: {last_msg}"
+                        reply_line = (
+                            f"{format_sender(sname, sid, sender_tags)}: {last_msg}"
+                        )
                         prompt_last_msg = last_msg
                         prompt_reply_line = reply_line
 
@@ -1543,33 +1738,32 @@ class Scheduler:
                             )
                         except Exception:
                             pass
-                        memory_context, admin_protocols_text = (
-                            await self._await_task_stage(
-                                task,
-                                "build_memory_context",
-                                self.build_memory_context(
-                                    last_msg,
-                                    gid,
-                                    sname,
-                                    history_msgs,
-                                    sid,
-                                    conversation,
-                                    is_group=bool(task.event.get_group_id())
-                                    if task.event
-                                    else False,
-                                    task_type=task.task_type,
-                                    self_id=(
-                                        task.event.get_self_id()
-                                        if task.event
-                                        else ""
-                                    ),
-                                    recent_participants=[
-                                        (str(_sid), str(_s or "User"))
-                                        for (_mid, _t, _s, _sid, _ts) in (raw_pending or [])
-                                        if _sid
-                                    ],
+                        (
+                            memory_context,
+                            admin_protocols_text,
+                        ) = await self._await_task_stage(
+                            task,
+                            "build_memory_context",
+                            self.build_memory_context(
+                                last_msg,
+                                gid,
+                                sname,
+                                history_msgs,
+                                sid,
+                                conversation,
+                                is_group=bool(task.event.get_group_id())
+                                if task.event
+                                else False,
+                                task_type=task.task_type,
+                                self_id=(
+                                    task.event.get_self_id() if task.event else ""
                                 ),
-                            )
+                                recent_participants=[
+                                    (str(_sid), str(_s or "User"))
+                                    for (_mid, _t, _s, _sid, _ts) in (raw_pending or [])
+                                    if _sid
+                                ],
+                            ),
                         )
 
                         quote_candidates = []
@@ -1582,32 +1776,36 @@ class Scheduler:
 
                             ref_window = int(self._get_conf("ref_context_window", 0))
                             if ref_window <= 0:
-                                ref_window = int(self._get_conf("at_pending_max_msgs", 30))
+                                ref_window = int(
+                                    self._get_conf("at_pending_max_msgs", 30)
+                                )
                             include_referenced = bool(
                                 self._get_conf("ref_context_include_referenced", True)
                             )
-                            prompt_lines, quote_candidates, index_to_id = build_ref_context(
-                                raw_pending if raw_pending else [],
-                                None,
-                                None,
-                                get_reply_target=lambda mid: self.state.get_reply_target(
-                                    umo, mid
-                                ),
-                                get_reply_summary=lambda rid: self.state.get_reply_summary(
-                                    umo, rid
-                                ),
-                                get_message_meta=lambda mid: self.state.get_message_meta(
-                                    umo, mid
-                                ),
-                                max_items=ref_window,
-                                include_referenced=include_referenced,
-                                time_gap_min_minutes=int(
-                                    self._get_conf("history_time_gap_minutes", 15)
-                                ),
-                                time_marker_every_n_messages=int(
-                                    self._get_conf("history_time_marker_every_n", 4)
-                                ),
-                                sender_tags=sender_tags,
+                            prompt_lines, quote_candidates, index_to_id = (
+                                build_ref_context(
+                                    raw_pending if raw_pending else [],
+                                    None,
+                                    None,
+                                    get_reply_target=lambda mid: (
+                                        self.state.get_reply_target(umo, mid)
+                                    ),
+                                    get_reply_summary=lambda rid: (
+                                        self.state.get_reply_summary(umo, rid)
+                                    ),
+                                    get_message_meta=lambda mid: (
+                                        self.state.get_message_meta(umo, mid)
+                                    ),
+                                    max_items=ref_window,
+                                    include_referenced=include_referenced,
+                                    time_gap_min_minutes=int(
+                                        self._get_conf("history_time_gap_minutes", 15)
+                                    ),
+                                    time_marker_every_n_messages=int(
+                                        self._get_conf("history_time_marker_every_n", 4)
+                                    ),
+                                    sender_tags=sender_tags,
+                                )
                             )
                             seen_sids = set()
                             for _m, _t, _s, _sid, _ts in raw_pending or []:
@@ -1653,7 +1851,11 @@ class Scheduler:
                                 history_lines=prompt_lines,
                                 mood_text=self.state.get_last_mood(umo),
                                 target_block=target_block,
+                                batch_mode=group_batch,
                             )
+                            large_group_note = self._large_group_decision_note(umo)
+                            if large_group_note:
+                                prompt = large_group_note + "\n" + prompt
                             hb_ts = self.state.get_heartbeat_start(umo)
                             if hb_ts:
                                 ts_str = time.strftime(
@@ -1662,15 +1864,16 @@ class Scheduler:
                                 prompt = f"【心跳开始】{ts_str}\n" + prompt
                         elif task.task_type == "focus":
                             use_decision = bool(
-                                self._get_conf("focus_non_at_use_decision_prompt", False)
+                                self._get_conf(
+                                    "focus_non_at_use_decision_prompt", False
+                                )
                             )
                             self_id = self.state.get_self_id(umo)
                             if use_decision and self_id:
                                 has_at = False
                                 for _mid, _t, _s, _sid, _ts in raw_pending:
                                     if _t and (
-                                        f"@{self_id}" in _t
-                                        or f"[At:{self_id}]" in _t
+                                        f"@{self_id}" in _t or f"[At:{self_id}]" in _t
                                     ):
                                         has_at = True
                                         break
@@ -1685,6 +1888,7 @@ class Scheduler:
                                     history_lines=prompt_lines,
                                     mood_text=self.state.get_last_mood(umo),
                                     target_block=target_block,
+                                    batch_mode=group_batch,
                                 )
                             else:
                                 prompt = build_focus_prompt(
@@ -1695,6 +1899,7 @@ class Scheduler:
                                     history_lines=prompt_lines,
                                     mood_text=self.state.get_last_mood(umo),
                                     target_block=target_block,
+                                    batch_mode=group_batch,
                                 )
                             fs_ts = self.state.get_focus_start(umo)
                             if fs_ts:
@@ -1711,6 +1916,7 @@ class Scheduler:
                                 history_lines=prompt_lines,
                                 mood_text=self.state.get_last_mood(umo),
                                 target_block=target_block,
+                                batch_mode=group_batch,
                             )
 
                         prompt = self._strip_old_decision_blocks(prompt)
@@ -1741,11 +1947,15 @@ class Scheduler:
                                             "impression_focus_end_threshold_sec", 10
                                         )
                                     )
-                                    if bool(
-                                        self._get_conf(
-                                            "impression_stream_focus_final", True
+                                    if (
+                                        bool(
+                                            self._get_conf(
+                                                "impression_stream_focus_final", True
+                                            )
                                         )
-                                    ) and rem > 0 and rem <= max(1.0, end_thr):
+                                        and rem > 0
+                                        and rem <= max(1.0, end_thr)
+                                    ):
                                         impression_mode = "final"
                                     elif bool(
                                         self._get_conf(
@@ -1776,7 +1986,10 @@ class Scheduler:
                         finally:
                             self.state.set_processing(umo, False)
 
-                        if replied:
+                        send_ok = bool(
+                            getattr(task.event, "_mem_chat_last_send_ok", False)
+                        )
+                        if replied and send_ok:
                             self._maybe_update_affinity_from_mood(
                                 umo=umo,
                                 task_type=str(task.task_type or ""),
@@ -1786,33 +1999,54 @@ class Scheduler:
                                 history_msgs=history_msgs,
                             )
 
-                        # Update last send time for dedup window
+                        # no_reply is consumed (pending can be cleared) but is
+                        # not a sent reply. It must not refresh focus, affinity or
+                        # the dedup send window.
+                        sent = bool(replied and send_ok)
+
+                        # Let the optional private-scene coordinator observe the
+                        # completed turn.  It owns autonomous follow-up timers but
+                        # never sends inside this scheduler queue.
+                        await self._notify_scene_after_turn(
+                            umo,
+                            task.event,
+                            str(task.task_type or ""),
+                            sent=sent,
+                            replied=bool(replied),
+                        )
+
                         if replied:
+                            consume_ts = time.time()
                             consumed_count = len(raw_pending)
-                            if consumed_count > 0:
-                                self.state.clear_pending_first_n(umo, consumed_count)
-                            send_ts = time.time()
-                            self._last_send_ts[umo] = send_ts
-                            self.state.clear_pending_up_to(umo, send_ts)
+                            self.state.consume_pending_messages(umo, raw_pending)
                             self.state.set_last_cycle_cutoff(umo, cycle_cutoff_ts)
+                            if sent:
+                                self._last_send_ts[umo] = consume_ts
                             logger.info(
-                                f"[mem_chat] {task.task_type.upper()} phase finished for {umo}."
+                                f"[mem_chat] {task.task_type.upper()} phase consumed messages for {umo} (sent={sent})."
                             )
                         else:
                             logger.info(
                                 f"[mem_chat] {task.task_type.upper()} task failed/interrupted for {umo}. Messages retained in pending."
                             )
-                            if task.task_type == "focus" and self.state.is_in_focus(umo):
+                            if task.task_type == "focus" and self.state.is_in_focus(
+                                umo
+                            ):
                                 self._deferred_focus[umo] = True
 
-                        # If read_air mode and replied, enter focus mode
-                        if task.task_type == "read_air" and replied:
-                            dur_min, dur_max, _dur_step_max, dur_base = self._focus_duration_bounds()
+                        # Only a real sent reply can start focus mode.
+                        if task.task_type == "read_air" and sent:
+                            dur_min, dur_max, _dur_step_max, dur_base = (
+                                self._focus_duration_bounds()
+                            )
                             focus_duration = int(dur_base)
                             if focus_duration < dur_min:
                                 focus_duration = dur_min
                             elif focus_duration > dur_max:
                                 focus_duration = dur_max
+                            focus_duration = self._cap_focus_duration(
+                                umo, focus_duration
+                            )
                             self.state.set_focus(
                                 umo, focus_duration
                             )  # This sets state to FOCUS
@@ -1820,9 +2054,11 @@ class Scheduler:
                                 f"[mem_chat] Read Air triggered reply. Entering Focus Mode (Duration: {focus_duration}s)."
                             )
 
-                        # If focus mode task completed, apply cooling
-                        if replied:
-                            cycle_min, cycle_max, cycle_step_max, base_delay = self._focus_cycle_bounds()
+                        # If focus mode task completed with a real send, apply cooling
+                        if sent:
+                            cycle_min, cycle_max, cycle_step_max, base_delay = (
+                                self._focus_cycle_bounds(umo)
+                            )
 
                             if task.task_type == "focus":
                                 curr_delay = self.state.get_focus_delay(
@@ -1835,14 +2071,18 @@ class Scheduler:
                                     float(cycle_min),
                                     float(cycle_max),
                                 )
-                                self.state.set_focus_delay(umo, next_delay, min_val=cycle_min)
+                                self.state.set_focus_delay(
+                                    umo, next_delay, min_val=cycle_min
+                                )
                                 logger.info(
                                     f"[mem_chat] FOCUS reply applied. Next focus delay set to {self.state.get_focus_delay(umo, default=base_delay):.2f}s."
                                 )
 
                         if replied and self.state.is_in_focus(umo):
                             await self.trigger_view_cycle(umo, "focus", task.event, [])
-                        elif self._deferred_focus.pop(umo, False) and self.state.is_in_focus(umo):
+                        elif self._deferred_focus.pop(
+                            umo, False
+                        ) and self.state.is_in_focus(umo):
                             await self.trigger_view_cycle(umo, "focus", task.event, [])
 
                         # Note: Next cycle triggering is now handled in finally block of _cycle_wait_and_submit
@@ -1856,8 +2096,10 @@ class Scheduler:
                     queue.task_done()
 
         finally:
-            self.active_queues.remove(umo)
+            self.active_queues.discard(umo)
             logger.info(f"[mem_chat] Queue processor stopped for {umo}")
+            if self._deferred_focus.pop(umo, False) and self.state.is_in_focus(umo):
+                await self.trigger_view_cycle(umo, "focus", task.event, [])
 
     async def _get_conversation(self, event: AstrMessageEvent):
         try:
@@ -1905,7 +2147,9 @@ class Scheduler:
                 group_id = str(umo or "").rsplit(":", 1)[-1].strip()
             sender_tags = load_sender_tags(group_id) if group_id else {}
 
-            char_budget_default = int(self._get_conf("history_char_budget", 3200) or 3200)
+            char_budget_default = int(
+                self._get_conf("history_char_budget", 3200) or 3200
+            )
             char_budget_at = int(
                 self._get_conf("history_char_budget_at", max(char_budget_default, 4200))
                 or max(char_budget_default, 4200)
@@ -1935,10 +2179,12 @@ class Scheduler:
 
             min_lines_default = int(self._get_conf("history_min_lines", 4) or 4)
             min_lines_focus = int(
-                self._get_conf("history_min_lines_focus", min_lines_default) or min_lines_default
+                self._get_conf("history_min_lines_focus", min_lines_default)
+                or min_lines_default
             )
             min_lines_read_air = int(
-                self._get_conf("history_min_lines_read_air", min_lines_default) or min_lines_default
+                self._get_conf("history_min_lines_read_air", min_lines_default)
+                or min_lines_default
             )
             if task_norm == "focus":
                 min_lines = min_lines_focus
@@ -2008,7 +2254,9 @@ class Scheduler:
                         normalized_rows: list[tuple[str, str, str, str]] = []
                         for m in take:
                             try:
-                                if isinstance(m, dict) and bool(m.get("_no_reply", False)):
+                                if isinstance(m, dict) and bool(
+                                    m.get("_no_reply", False)
+                                ):
                                     continue
                                 role = str(m.get("role") or "").strip()
                                 sname = str(m.get("sender_name") or "").strip()
@@ -2041,21 +2289,27 @@ class Scheduler:
                                 except Exception:
                                     pass
 
-                                sender_part = format_sender(sname, sid, sender_tags) or sname
+                                sender_part = (
+                                    format_sender(sname, sid, sender_tags) or sname
+                                )
                                 if not sid and role == "assistant":
                                     sender_part = (
                                         self.state.get_self_name(umo) or "Assistant"
                                     )
 
                                 if sender_part and content:
-                                    normalized_rows.append((role, sender_part, sid, content))
+                                    normalized_rows.append(
+                                        (role, sender_part, sid, content)
+                                    )
                                 elif content:
                                     normalized_rows.append((role, "", sid, content))
                             except Exception:
                                 continue
                         total_chars = 0
                         selected: list[str] = []
-                        for role, sender_part, _sid, content in reversed(normalized_rows):
+                        for role, sender_part, _sid, content in reversed(
+                            normalized_rows
+                        ):
                             if not include_assistant and role == "assistant":
                                 continue
                             line = (
@@ -2135,7 +2389,9 @@ class Scheduler:
                 f"请保持简洁，不要超过200字。\n\n"
                 f"{history_text}"
             )
-            system_prompt = "你是一个善于总结对话的助手。请客观地总结用户的特征和对话内容。"
+            system_prompt = (
+                "你是一个善于总结对话的助手。请客观地总结用户的特征和对话内容。"
+            )
             summary = await self.llm_client.generate_text(
                 prompt, system_prompt=system_prompt, umo=umo
             )
@@ -2166,7 +2422,9 @@ class Scheduler:
         )
         system_prompt = "你擅长从对话中提取稳定且可验证的用户画像要点。"
 
-        raw = await self.llm_client.generate_text(prompt, system_prompt=system_prompt, umo=umo)
+        raw = await self.llm_client.generate_text(
+            prompt, system_prompt=system_prompt, umo=umo
+        )
         if not raw:
             logger.info(
                 f"[mem_chat] Summarize session skipped: empty output for {sender_name}/{sender_id}"
@@ -2232,7 +2490,9 @@ class Scheduler:
                 parts.append("印象：" + str(p["impression_summary"]))
             if p.get("tags"):
                 try:
-                    tags = [str(x).strip() for x in (p.get("tags") or []) if str(x).strip()]
+                    tags = [
+                        str(x).strip() for x in (p.get("tags") or []) if str(x).strip()
+                    ]
                 except Exception:
                     tags = []
                 if tags:
@@ -2264,25 +2524,83 @@ class Scheduler:
             version=3,
         )
         try:
-            self.db_mgr.increment_user_profile_msg_count(group_id, str(sender_id), len(history))
+            self.db_mgr.increment_user_profile_msg_count(
+                group_id, str(sender_id), len(history)
+            )
         except Exception:
             pass
 
         try:
             for t in profile.get("tags") or []:
-                self.db_mgr.upsert_profile_fact(group_id, str(sender_id), "tag", t, polarity=1, confidence=0.6, evidence_count=1)
+                self.db_mgr.upsert_profile_fact(
+                    group_id,
+                    str(sender_id),
+                    "tag",
+                    t,
+                    polarity=1,
+                    confidence=0.6,
+                    evidence_count=1,
+                )
             for t in profile.get("traits") or []:
-                self.db_mgr.upsert_profile_fact(group_id, str(sender_id), "trait", t, polarity=1, confidence=0.7, evidence_count=1)
+                self.db_mgr.upsert_profile_fact(
+                    group_id,
+                    str(sender_id),
+                    "trait",
+                    t,
+                    polarity=1,
+                    confidence=0.7,
+                    evidence_count=1,
+                )
             for t in profile.get("preferences") or []:
-                self.db_mgr.upsert_profile_fact(group_id, str(sender_id), "like", t, polarity=1, confidence=0.7, evidence_count=1)
+                self.db_mgr.upsert_profile_fact(
+                    group_id,
+                    str(sender_id),
+                    "like",
+                    t,
+                    polarity=1,
+                    confidence=0.7,
+                    evidence_count=1,
+                )
             for t in profile.get("dislikes") or []:
-                self.db_mgr.upsert_profile_fact(group_id, str(sender_id), "dislike", t, polarity=-1, confidence=0.7, evidence_count=1)
+                self.db_mgr.upsert_profile_fact(
+                    group_id,
+                    str(sender_id),
+                    "dislike",
+                    t,
+                    polarity=-1,
+                    confidence=0.7,
+                    evidence_count=1,
+                )
             for t in profile.get("current_topics") or []:
-                self.db_mgr.upsert_profile_fact(group_id, str(sender_id), "topic", t, polarity=1, confidence=0.6, evidence_count=1)
+                self.db_mgr.upsert_profile_fact(
+                    group_id,
+                    str(sender_id),
+                    "topic",
+                    t,
+                    polarity=1,
+                    confidence=0.6,
+                    evidence_count=1,
+                )
             for t in profile.get("boundaries") or []:
-                self.db_mgr.upsert_profile_fact(group_id, str(sender_id), "boundary", t, polarity=1, confidence=0.8, evidence_count=1)
+                self.db_mgr.upsert_profile_fact(
+                    group_id,
+                    str(sender_id),
+                    "boundary",
+                    t,
+                    polarity=1,
+                    confidence=0.8,
+                    evidence_count=1,
+                )
             for t in profile.get("uncertain") or []:
-                self.db_mgr.upsert_profile_fact(group_id, str(sender_id), "uncertain", t, polarity=0, confidence=0.4, evidence_count=1)
+                self.db_mgr.upsert_profile_fact(
+                    group_id,
+                    str(sender_id),
+                    "uncertain",
+                    t,
+                    polarity=0,
+                    confidence=0.4,
+                    evidence_count=1,
+                )
         except Exception:
             pass
 
@@ -2338,9 +2656,10 @@ class Scheduler:
             return " ".join(f"「{x}」" for x in lines)
 
         def _add_block(text: str, priority: int) -> None:
-            cleaned = str(text or '').strip()
+            cleaned = str(text or "").strip()
             if cleaned:
                 context_parts.append((priority, cleaned))
+
         admin_protocols_text = ""
         task_norm = str(task_type or "").strip().lower()
         is_at_task = task_norm == "at"
@@ -2399,7 +2718,10 @@ class Scheduler:
             raw = str(text or "").strip()
             if not raw:
                 return ""
-            if not ((raw.startswith("{") and raw.endswith("}")) or (raw.startswith("[") and raw.endswith("]"))):
+            if not (
+                (raw.startswith("{") and raw.endswith("}"))
+                or (raw.startswith("[") and raw.endswith("]"))
+            ):
                 return raw
             try:
                 data = json.loads(raw)
@@ -2522,11 +2844,16 @@ class Scheduler:
             )
             impression_scan_limit = max(
                 0,
-                int(self._get_conf("semantic_recall_scan_limit_impression_at", 800) or 0),
+                int(
+                    self._get_conf("semantic_recall_scan_limit_impression_at", 800) or 0
+                ),
             )
             impression_v3_scan_limit = max(
                 0,
-                int(self._get_conf("semantic_recall_scan_limit_impression_v3_at", 800) or 0),
+                int(
+                    self._get_conf("semantic_recall_scan_limit_impression_v3_at", 800)
+                    or 0
+                ),
             )
         if task_norm in ("focus", "read_air"):
             limit_mem = max(
@@ -2576,9 +2903,7 @@ class Scheduler:
                 self._get_conf("impression_semantic_at_enabled", False)
             )
         impression_v3_enabled = bool(self._get_conf("impression_v3_enabled", True))
-        impression_active_only = bool(
-            self._get_conf("impression_active_only", True)
-        )
+        impression_active_only = bool(self._get_conf("impression_active_only", True))
         impression_merge_recent_participants = bool(
             self._get_conf("impression_merge_recent_participants", True)
         )
@@ -2608,13 +2933,19 @@ class Scheduler:
         if is_at_task:
             max_persons = max(
                 1,
-                min(max_persons, int(self._get_conf("impression_related_max_persons_at", 3))),
+                min(
+                    max_persons,
+                    int(self._get_conf("impression_related_max_persons_at", 3)),
+                ),
             )
         max_per_person = int(self._get_conf("max_impressions_per_person", 3))
         if is_at_task:
             max_per_person = max(
                 1,
-                min(max_per_person, int(self._get_conf("max_impressions_per_person_at", 2))),
+                min(
+                    max_per_person,
+                    int(self._get_conf("max_impressions_per_person_at", 2)),
+                ),
             )
         min_score_impr = float(
             self._get_conf(
@@ -2622,9 +2953,7 @@ class Scheduler:
                 self._get_conf("impression_min_score", 0.35),
             )
         )
-        impression_token_budget = int(
-            self._get_conf("impression_token_budget", 400)
-        )
+        impression_token_budget = int(self._get_conf("impression_token_budget", 400))
         if is_at_task:
             impression_token_budget = max(
                 0,
@@ -2644,7 +2973,11 @@ class Scheduler:
             )
         else:
             impressions_task = asyncio.sleep(0, result=[])
-        if impression_inject_enabled and impression_semantic_enabled and impression_v3_enabled:
+        if (
+            impression_inject_enabled
+            and impression_semantic_enabled
+            and impression_v3_enabled
+        ):
             impressions_v3_task = self.db_mgr.semantic_recall_impression_v3_with_qemb(
                 qemb,
                 group_id,
@@ -2667,9 +3000,7 @@ class Scheduler:
             memories_task,
             impressions_task,
             impressions_v3_task,
-            reflections_task
-            if reflections_task is not None
-            else _empty_recall(),
+            reflections_task if reflections_task is not None else _empty_recall(),
         )
 
         knowledge_limit = 5
@@ -2693,14 +3024,18 @@ class Scheduler:
                     k_text += f"- {content}\n"
             _add_block(k_text, 40)
 
-        persona_rag_non_at_enabled = bool(self._get_conf("persona_rag_non_at_enabled", False))
+        persona_rag_non_at_enabled = bool(
+            self._get_conf("persona_rag_non_at_enabled", False)
+        )
         if task_norm in ("focus", "read_air") and not persona_rag_non_at_enabled:
             persona_rag = []
         else:
             persona_rag = list(raw_persona_rag[:persona_rag_limit])
         if len(persona_rag) < 5:
             try:
-                fallback_items = await self.db_mgr.get_all_embeddings_by_type("persona_rag", limit=50)
+                fallback_items = await self.db_mgr.get_all_embeddings_by_type(
+                    "persona_rag", limit=50
+                )
             except Exception:
                 fallback_items = []
             seen = {" ".join(str(x[0] or "").split()).strip() for x in persona_rag}
@@ -2764,7 +3099,7 @@ class Scheduler:
                 qk = _memory_body_key(query)
                 if qk:
                     recent_echo_keys.add(qk)
-                for ln in (history_msgs or []):
+                for ln in history_msgs or []:
                     hk = _memory_body_key(ln)
                     if hk:
                         recent_echo_keys.add(hk)
@@ -2802,7 +3137,10 @@ class Scheduler:
             if not uid or not group_id:
                 return ""
             hint = re.sub(r"\s+", " ", str(name_hint or "")).strip()
-            if hint.lower() in {"user", "unknown", "system"} or hint in {"未知", "匿名"}:
+            if hint.lower() in {"user", "unknown", "system"} or hint in {
+                "未知",
+                "匿名",
+            }:
                 hint = ""
             try:
                 aliases = self.db_mgr.list_user_aliases(group_id, uid, limit=8)
@@ -2833,7 +3171,9 @@ class Scheduler:
                 return f"- 曾用昵称：{'、'.join(historical[:5])}"
             return f"- 当前昵称：{current}"
 
-        def _build_user_impression_lines(uid: str, name_hint: str | None = None) -> list[str]:
+        def _build_user_impression_lines(
+            uid: str, name_hint: str | None = None
+        ) -> list[str]:
             uid = str(uid or "").strip()
             if not uid or not group_id:
                 return []
@@ -2866,9 +3206,9 @@ class Scheduler:
                     prof = None
                 if prof:
                     _name, pjson, canon = prof
-                    txt = _normalize_impression_text(canon or "") or _normalize_impression_text(
-                        pjson or ""
-                    )
+                    txt = _normalize_impression_text(
+                        canon or ""
+                    ) or _normalize_impression_text(pjson or "")
                     if txt:
                         lines.append(f"- 印象：{txt}")
             if not lines:
@@ -2897,7 +3237,11 @@ class Scheduler:
                 aff_state_raw = self.db_mgr.get_affinity_state(group_id, uid)
                 if aff_state_raw:
                     _last_evt = aff_state_raw[3]
-                    if (_last_evt or 0) > 0 and idle_sec > 0 and time.time() - float(_last_evt) > idle_sec:
+                    if (
+                        (_last_evt or 0) > 0
+                        and idle_sec > 0
+                        and time.time() - float(_last_evt) > idle_sec
+                    ):
                         self.db_mgr.decay_affinity_towards_neutral(
                             group_id,
                             step=float(self._get_conf("affinity_decay_step", 1.0)),
@@ -2910,9 +3254,9 @@ class Scheduler:
                 return ""
             affinity, trust, mood_bias, _last_evt, _updated = aff_state
             relation = "中性"
-            if affinity >= 35:
+            if affinity >= 20:
                 relation = "明显喜欢"
-            elif affinity >= 12:
+            elif affinity >= 8:
                 relation = "偏喜欢"
             elif affinity <= -35:
                 relation = "明显反感"
@@ -2923,7 +3267,9 @@ class Scheduler:
         participants_ordered: list[tuple[str, str]] = []
         recent_window_uids: set[str] = set()
 
-        def _extract_participants_from_lines(lines: list[str] | None) -> list[tuple[str, str]]:
+        def _extract_participants_from_lines(
+            lines: list[str] | None,
+        ) -> list[tuple[str, str]]:
             out: list[tuple[str, str]] = []
             for ln in lines or []:
                 txt = str(ln or "").strip()
@@ -2937,6 +3283,7 @@ class Scheduler:
                 if uid:
                     out.append((uid, name))
             return out
+
         if impression_merge_recent_participants:
             seen_uid: set[str] = set()
             for uid_raw, name_raw in recent_participants or []:
@@ -2947,7 +3294,9 @@ class Scheduler:
                 participants_ordered.append((uid, str(name_raw or "User")))
             # Also include speakers appearing in the latest dialogue window.
             # history_msgs here is already the recent prompt window (read_air/focus limited by config).
-            for uid, name in _extract_participants_from_lines((history_msgs or []) + [query]):
+            for uid, name in _extract_participants_from_lines(
+                (history_msgs or []) + [query]
+            ):
                 if uid in seen_uid:
                     continue
                 seen_uid.add(uid)
@@ -3003,7 +3352,9 @@ class Scheduler:
                         if fact:
                             lines.append(f"- {fact}")
                     if lines:
-                        return f"【人物印象】\n{v3_name}/{sender_id}:\n" + "\n".join(lines)
+                        return f"【人物印象】\n{v3_name}/{sender_id}:\n" + "\n".join(
+                            lines
+                        )
             prof = None
             try:
                 prof = self.db_mgr.get_user_profile(group_id, sender_id)
@@ -3011,9 +3362,9 @@ class Scheduler:
                 prof = None
             if prof:
                 name, pjson, canon = prof
-                txt = _normalize_impression_text(canon or "") or _normalize_impression_text(
-                    pjson or ""
-                )
+                txt = _normalize_impression_text(
+                    canon or ""
+                ) or _normalize_impression_text(pjson or "")
                 if txt:
                     lines = []
                     if alias_line:
@@ -3036,7 +3387,9 @@ class Scheduler:
                     if alias_line:
                         lines.append(alias_line)
                     lines.append(str(impression))
-                    return f"【人物印象】\n关于 {sender_name} 的印象：\n" + "\n".join(lines)
+                    return f"【人物印象】\n关于 {sender_name} 的印象：\n" + "\n".join(
+                        lines
+                    )
             return ""
 
         sender_impression_block = (
@@ -3044,7 +3397,11 @@ class Scheduler:
             if (impression_inject_enabled and not impression_merge_recent_participants)
             else ""
         )
-        if impression_sender_pinned and sender_impression_block and not impression_merge_recent_participants:
+        if (
+            impression_sender_pinned
+            and sender_impression_block
+            and not impression_merge_recent_participants
+        ):
             _add_block(sender_impression_block, 90)
 
         # Only keep impressions for users who are actually present in this turn context.
@@ -3088,7 +3445,11 @@ class Scheduler:
                     if uid in recent_window_uids:
                         continue
                 else:
-                    if impression_active_only and active_uids and uid not in active_uids:
+                    if (
+                        impression_active_only
+                        and active_uids
+                        and uid not in active_uids
+                    ):
                         continue
                 if impression_sender_pinned and sender_id and uid == str(sender_id):
                     continue
@@ -3183,7 +3544,11 @@ class Scheduler:
                     if uid in recent_window_uids:
                         continue
                 else:
-                    if impression_active_only and active_uids and uid not in active_uids:
+                    if (
+                        impression_active_only
+                        and active_uids
+                        and uid not in active_uids
+                    ):
                         continue
                 if impression_sender_pinned and sender_id and uid == str(sender_id):
                     continue
@@ -3221,7 +3586,10 @@ class Scheduler:
                     if not items:
                         continue
                     line_head = f"{name}/{uid}:\n"
-                    if impression_token_budget > 0 and used_budget + len(line_head) > impression_token_budget:
+                    if (
+                        impression_token_budget > 0
+                        and used_budget + len(line_head) > impression_token_budget
+                    ):
                         break
                     i_text += line_head
                     used_budget += len(line_head)
@@ -3272,9 +3640,9 @@ class Scheduler:
             if aff_state:
                 affinity, trust, mood_bias, _last_evt, _updated = aff_state
                 relation = "中性"
-                if affinity >= 35:
+                if affinity >= 20:
                     relation = "明显喜欢"
-                elif affinity >= 12:
+                elif affinity >= 8:
                     relation = "偏喜欢"
                 elif affinity <= -35:
                     relation = "明显反感"

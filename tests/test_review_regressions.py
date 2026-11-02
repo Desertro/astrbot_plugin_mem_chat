@@ -309,3 +309,293 @@ async def test_selected_meme_metadata_keeps_original_after_resize(service, emoti
         await svc.pick_meme_image_file(query="no match", selected_meme=selected) is None
     )
     assert selected == {}
+
+
+def test_private_prompt_uses_private_scope_and_warmth_rules():
+    sys.path.insert(0, str(PLUGIN))
+    try:
+        from src.llm_client import LLMClient
+    finally:
+        sys.path.pop(0)
+    state = SimpleNamespace(
+        get_last_mood_state=lambda _umo: "中性",
+        get_mood_state_ttl_remaining=lambda _umo: 0,
+        get_self_id=lambda _umo: "",
+        get_self_name=lambda _umo: "",
+    )
+    client = LLMClient(SimpleNamespace(config={}, state=state))
+    instructions = client._get_instruction_prompts(is_private=True)
+    assert "【私聊技能总模板" in instructions
+    assert "群聊技能总模板" not in instructions
+    assert "私聊里对方的话默认是在对你说" in instructions
+    assert "第一轮就积极接住" in instructions
+    assert "R2." in instructions
+
+    private_system = client._build_system_prompts(
+        None, "", "default:FriendMessage:10001"
+    )
+    assert "要不要开口｜私聊" in private_system
+    assert "不要当群聊旁白" in private_system
+
+    group_system = client._build_system_prompts(None, "", "default:GroupMessage:20002")
+    assert "先做出情绪反应" in group_system
+    assert "不要当旁观解说员" in group_system
+    assert "表情可以单独作为一次回应" in group_system
+    assert "少用“爱丽丝觉得" in group_system
+    for prompt in (instructions, private_system, group_system):
+        assert "自称统一使用“爱丽丝”" in prompt
+        assert "不用“我”或“人家”自称" in prompt
+        assert "凯伊" in prompt
+        assert "引用他人原话时保留原有称谓" in prompt
+    assert "普通群聊保持原设语气" in group_system
+
+
+def test_persona_is_friendly_by_default_and_proactive_in_erotic_mode():
+    """Guard the current persona direction against regressions."""
+    sys.path.insert(0, str(PLUGIN))
+    try:
+        from src.llm_client import LLMClient
+    finally:
+        sys.path.pop(0)
+    state = SimpleNamespace(
+        get_last_mood_state=lambda _umo: "中性",
+        get_mood_state_ttl_remaining=lambda _umo: 0,
+        get_self_id=lambda _umo: "",
+        get_self_name=lambda _umo: "",
+    )
+    client = LLMClient(SimpleNamespace(config={}, state=state))
+    rules = client._load_state_rules()
+    assert "默认对普通群友友善" in rules["read_air"]
+    assert "先对消息本身有反应" in rules["read_air"]
+    assert "不要每次都写成旁观短评" in rules["read_air"]
+    assert "先有情绪反应" in rules["focus:中性"]
+    assert "主动带节奏" in rules["focus:色色"]
+    assert "每轮至少主动推进" in rules["focus:色色"]
+
+    persona = (PLUGIN / "personas/personas.txt").read_text(encoding="utf-8")
+    assert "默认对普通人是善意、友好" in persona
+    assert "只有对方有讨嫌或冒犯行为" in persona
+    assert "不要只当被动应答器" in persona
+    assert "人味不等于完整短评" in persona
+    assert "自称统一使用“爱丽丝”" in persona
+    assert "不用“我”或“人家”自称" in persona
+    assert "Kei用“我”自称时指Kei自己" in persona
+    assert "凯伊保留独立自称" in persona
+    assert "不要每句都重复" in persona
+    assert "原设日常语气" in persona
+    assert "表情包是日常语气的一部分" in persona
+    assert "爱丽丝，好像明白了！" in persona
+    assert "不能拿来装傻逃避擦边" in persona
+    assert "对方在难受" in persona
+    assert "不立刻讨好" in persona
+
+    private_system = client._build_system_prompts(
+        None, "", "default:FriendMessage:10001"
+    )
+    assert "普通正常互动默认善意" in private_system
+    assert "主动带节奏" in private_system
+    assert "不立刻讨好" in private_system
+
+    group_system = client._build_system_prompts(None, "", "default:GroupMessage:20002")
+    assert "默认对普通群友友善" in group_system
+    assert "不把普通群友当靶子" in group_system
+    assert "直接冲你骂" in group_system
+
+
+def test_at_prompt_uses_proactive_flirty_state_not_previous_sarcasm():
+    """An @ reply must not inherit the stale sarcastic mood or lose the persona."""
+    sys.path.insert(0, str(PLUGIN))
+    try:
+        from src.llm_client import LLMClient
+    finally:
+        sys.path.pop(0)
+    state = SimpleNamespace(
+        get_last_mood_state=lambda _umo: "讥讽",
+        get_mood_state_ttl_remaining=lambda _umo: 0,
+        get_self_id=lambda _umo: "",
+        get_self_name=lambda _umo: "",
+    )
+    client = LLMClient(SimpleNamespace(config={}, state=state))
+    rules = client._load_state_rules()
+    assert "at" in rules
+    at_rule = rules["at"]
+    assert "闷骚色小鬼" in at_rule
+    assert "明确邀请“涩涩”" in at_rule
+    assert "第一轮就接住" in at_rule
+    assert "当前 mood 的讥讽" in at_rule
+    assert "对方明确拒绝、喊停" in at_rule
+
+    system_prompt = client._build_system_prompts(
+        None,
+        "",
+        "default:GroupMessage:775066874",
+        task_type="at",
+    )
+    assert "被 @ 或点名的直接对话" in system_prompt
+    assert "明确邀请“涩涩”" in system_prompt
+    assert "第一轮就接住" in system_prompt
+    assert "只在对方讨嫌、冒犯或双方明确玩嘴硬梗时启用" not in system_prompt
+
+
+def test_group_prompt_allows_reaction_fragments_and_standalone_memes(monkeypatch):
+    """Keep group replies from collapsing into narrated one-liners."""
+    sys.path.insert(0, str(PLUGIN))
+    try:
+        from src.llm_client import LLMClient
+    finally:
+        sys.path.pop(0)
+    state = SimpleNamespace(
+        get_last_mood_state=lambda _umo: "中性",
+        get_mood_state_ttl_remaining=lambda _umo: 0,
+        get_self_id=lambda _umo: "",
+        get_self_name=lambda _umo: "",
+    )
+    client = LLMClient(
+        SimpleNamespace(config={}, state=state, context=SimpleNamespace())
+    )
+    monkeypatch.chdir(PLUGIN.parents[2])
+    instructions = client._get_instruction_prompts(is_private=False)
+    assert "表情可以作为单独一条消息" in instructions
+    assert "表情包是日常语气的一部分" in instructions
+    assert "纯文字能说清就不用加" not in instructions
+    assert "6.2a 表情可以单独作为一条消息" in instructions
+    assert "6.2b 历史消息末尾的" in instructions
+
+
+@pytest.mark.asyncio
+async def test_light_reaction_avoids_bawling_meme(service):
+    """Do not use a tearful sticker for a playful speechless reaction."""
+    svc, library, tags = service
+    paths = library([0.85, 0.80])
+    tags[paths[0]] = {"emotion": "委屈、大哭"}
+    selected = await svc.pick_meme_image_file(
+        query="被对方这套自我招供逗到无语又想笑，只想摊手", conversation_id="group-a"
+    )
+    assert selected == paths[1]
+
+
+def test_parse_validated_keeps_main_reply_before_tagged_metadata():
+    """Accept the model's JSON reply plus XML-like sidecar metadata blocks."""
+    sys.path.insert(0, str(PLUGIN))
+    try:
+        from src.llm.response_schemas import StructuredResponse
+    finally:
+        sys.path.pop(0)
+
+    raw = """{"control":{"decision":"reply_only"},"response":{"text":"上线收垃圾，听着像每天日常任务刷新了——那今天打算捡满几口袋？ [表情:听到日常任务刷新，觉得好笑又想调侃一句]"}}
+
+<mood>
+{"text":"听到熟悉的捡垃圾日常，忍不住想笑着接一句","state":"中性","ttl_sec":120,"intensity":0.3}
+</mood>
+
+<affinity>
+{"delta":1,"reason":"轻松接日常玩笑","target_qq":"1456941987"}
+</affinity>
+
+<memory_importance>2</memory_importance>
+
+<impression_delta>
+[]
+</impression_delta>"""
+    parsed = StructuredResponse.parse_validated(raw)
+    assert parsed is not None
+    assert parsed["control"]["decision"] == "reply_only"
+    assert "捡满几口袋" in parsed["response"]["text"]
+    assert parsed["mood"]["state"] == "中性"
+    assert parsed["affinity"]["delta"] == 1
+    assert parsed["memory_importance"] == 2
+
+
+def test_parse_validated_accepts_expression_only_reply():
+    """An emotion-only message is a reply, not structural metadata."""
+    sys.path.insert(0, str(PLUGIN))
+    try:
+        from src.llm.response_schemas import StructuredResponse
+    finally:
+        sys.path.pop(0)
+
+    raw = "  [表情:被这种理想工作逗到，羡慕又无奈地笑]"
+    parsed = StructuredResponse.parse_validated(raw)
+    assert parsed is not None
+    assert parsed["control"]["decision"] == "reply_only"
+    assert parsed["response"]["text"].startswith("[表情:")
+
+
+def test_internal_meme_history_note_never_reaches_chat():
+    """Model-copied sticker metadata is stripped from visible replies."""
+    sys.path.insert(0, str(PLUGIN))
+    try:
+        from src.llm_client import LLMClient
+    finally:
+        sys.path.pop(0)
+
+    client = LLMClient(SimpleNamespace(config={}))
+    raw = (
+        "鹿大师你这追问的架势，跟催更一样……鲸鲸都摆明不说了。"
+        "（实际发送的表情包：画面描述：表达“我不说、别问了”的嘴硬躲闪情绪，"
+        "可带点小得意，无文字。）"
+    )
+    assert (
+        client._sanitize_final_reply(raw)
+        == "鹿大师你这追问的架势，跟催更一样……鲸鲸都摆明不说了。"
+    )
+    assert (
+        client._sanitize_final_reply(
+            "（系统记录：本轮实际发送了表情包；画面描述：开心地笑；图中文字：无）"
+        )
+        == ""
+    )
+    assert (
+        client._strip_internal_meme_history_notes(
+            "正文（实际发送的表情包：画面描述：未闭合"
+        )
+        == "正文"
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "我会保护王女。",
+        "凯伊：我会保护王女。",
+        "爱丽丝明白了，我去看看。",
+        "人家才不要……我有自己的想法。",
+        "你说「人家好累」，我们晚点再聊。[表情:人家害羞]",
+        "自我怀疑也不会让我退开。",
+    ],
+)
+def test_final_reply_preserves_character_self_references(text):
+    """Preserve each speaker's first person through outgoing reply cleanup."""
+    sys.path.insert(0, str(PLUGIN))
+    try:
+        from src.llm_client import LLMClient
+    finally:
+        sys.path.pop(0)
+
+    client = LLMClient(SimpleNamespace(config={}))
+    assert client._sanitize_final_reply(text) == text
+
+
+@pytest.mark.asyncio
+async def test_empty_reply_only_payload_is_retriable_failure():
+    """An empty generation must not consume the message as a silent reply."""
+    sys.path.insert(0, str(PLUGIN))
+    try:
+        from src.llm_client import LLMClient
+    finally:
+        sys.path.pop(0)
+
+    client = LLMClient.__new__(LLMClient)
+    send_ok = await client._process_and_send_final_reply(
+        "",
+        None,
+        "at",
+        [],
+        [],
+        [],
+        "default:FriendMessage:853058285",
+        [],
+        None,
+    )
+
+    assert send_ok is False
