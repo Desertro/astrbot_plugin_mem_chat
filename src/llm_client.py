@@ -16,7 +16,7 @@ from urllib.parse import quote, urlparse
 import aiohttp
 
 from astrbot.api.event import AstrMessageEvent, MessageChain
-from astrbot.api.message_components import Image, Poke, Record, Reply
+from astrbot.api.message_components import At, Image, Plain, Poke, Record, Reply
 from astrbot.core import file_token_service
 from astrbot.core.agent.tool import ToolSet
 from astrbot.core.star.session_llm_manager import SessionServiceManager
@@ -5484,29 +5484,36 @@ class LLMClient:
                         except Exception:
                             pass
 
-                if chain.chain:
-                    send_attempted = True
-                    try:
+                # Quotes and mentions alone are not a reply after media selection fails.
+                has_content = any(
+                    not isinstance(part, (Reply, At))
+                    and (not isinstance(part, Plain) or part.text.strip())
+                    for part in chain.chain
+                )
+                try:
+                    if has_content:
+                        send_attempted = True
                         await send_event.send(chain)
                         if meme_history and sent_meme_descriptions is not None:
                             sent_meme_descriptions.append(meme_history)
-                    except Exception as e:
-                        send_failed = True
-                        logger.error(f"[mem_chat] Failed to send message chain: {e}")
-                    finally:
-                        for p in temp_files_to_clean:
-                            try:
-                                if p and os.path.exists(p):
-                                    os.remove(p)
-                            except Exception:
-                                pass
-                    if seg_idx < len(segments) - 1:
-                        await asyncio.sleep(
-                            _segment_delay_seconds(segment_text_for_msg or segment_text)
+                    else:
+                        logger.info(
+                            "[mem_chat] Skipped segment without reply content for %s.",
+                            umo,
                         )
-                else:
-                    logger.warning(
-                        f"[mem_chat] Message chain is empty for {umo}, nothing sent."
+                except Exception as e:
+                    send_failed = True
+                    logger.error(f"[mem_chat] Failed to send message chain: {e}")
+                finally:
+                    for p in temp_files_to_clean:
+                        try:
+                            if p and os.path.exists(p):
+                                os.remove(p)
+                        except Exception:
+                            pass
+                if has_content and seg_idx < len(segments) - 1:
+                    await asyncio.sleep(
+                        _segment_delay_seconds(segment_text_for_msg or segment_text)
                     )
 
             return bool(send_attempted and not send_failed)

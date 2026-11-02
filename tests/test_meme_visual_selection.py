@@ -201,3 +201,84 @@ async def test_intent_in_emotion_field_does_not_include_reply_body(emotion):
     )
     client._pick_meme_image_file.assert_awaited_once()
     assert client._pick_meme_image_file.await_args.args[:2] == ("", "害羞地躲开视线")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_type", ["focus", "at"])
+@pytest.mark.parametrize("leading_text", [False, True])
+@pytest.mark.parametrize("meme_result", ["missing", "selected", "blank"])
+async def test_sticker_only_segments_require_content_after_selection(
+    tmp_path, monkeypatch, task_type, leading_text, meme_result
+):
+    """Skip empty quoted segments while preserving text and real stickers."""
+    from astrbot.api.message_components import Image as MessageImage
+    from astrbot.api.message_components import Plain, Reply
+
+    client = LLMClient(SimpleNamespace(config={}, context=SimpleNamespace()))
+    meme = tmp_path / "meme_send_test.png"
+    Image.new("RGB", (32, 32), (100, 150, 200)).save(meme)
+    client._pick_meme_image_file = AsyncMock(
+        return_value=None if meme_result == "missing" else str(meme)
+    )
+    client._image_service.is_blank_image = lambda _path: meme_result == "blank"
+    client._recover_images_from_search_results = AsyncMock(return_value=False)
+    monkeypatch.setattr("src.llm_client.asyncio.sleep", AsyncMock())
+    event = SimpleNamespace(
+        message_str="吼姆拉是凑珠",
+        message_obj=SimpleNamespace(message=[], raw_message={}),
+        get_messages=lambda: [],
+        get_self_id=lambda: "3830090475",
+        get_sender_id=lambda: "710647939",
+        get_group_id=lambda: "1009481409",
+        send=AsyncMock(),
+    )
+    segments = []
+    if leading_text:
+        segments.append({"text": "这个称呼有点好笑。", "quote_index": 1})
+    segments.append({"text": "[表情:憋着笑又怕被点名]", "quote_index": 1})
+    sent_memes = []
+
+    result = await client._process_and_send_final_reply(
+        json.dumps(
+            {
+                "control": {"decision": "reply_only"},
+                "response": {"segments": segments},
+            },
+            ensure_ascii=False,
+        ),
+        event,
+        task_type,
+        [("123456", "吼姆拉是凑珠", "710647939")],
+        [],
+        [],
+        "default:GroupMessage:1009481409",
+        [],
+        sent_meme_descriptions=sent_memes,
+    )
+
+    expected_count = int(leading_text) + int(meme_result == "selected")
+    assert event.send.await_count == expected_count
+    assert result is bool(expected_count)
+    for call in event.send.await_args_list:
+        chain = call.args[0].chain
+        assert any(isinstance(part, Reply) for part in chain)
+        assert any(
+            isinstance(part, MessageImage)
+            or (isinstance(part, Plain) and part.text.strip())
+            for part in chain
+        )
+    if leading_text:
+        assert any(
+            isinstance(part, Plain) and "这个称呼有点好笑。" in part.text
+            for part in event.send.await_args_list[0].args[0].chain
+        )
+    if meme_result == "selected":
+        assert any(
+            isinstance(part, MessageImage)
+            for part in event.send.await_args_list[-1].args[0].chain
+        )
+        assert len(sent_memes) == 1
+    else:
+        assert sent_memes == []
+    if meme_result != "missing":
+        assert not meme.exists()
