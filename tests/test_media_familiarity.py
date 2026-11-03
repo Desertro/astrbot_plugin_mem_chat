@@ -107,12 +107,13 @@ def test_familiarity_block_only_marks_repeated_images_and_keeps_judgement():
         now=1_790_000_100.0,
     )
 
-    assert "共出现 6 次" in block
-    assert "熟面孔" in block
-    assert "不要再当成第一次见" in block
-    assert "- 可以自然地熟人式吐槽。" in block.splitlines()
-    assert "例如嫌对方怎么又发" not in block
-    assert "提不提次数由你判断" not in block
+    assert "是本会话里熟悉的表情包" in block
+    assert "- 可以围绕这次的意思自然地熟人式吐槽。" in block.splitlines()
+    assert "不表示今天刷屏" in block
+    assert "共出现" not in block
+    assert "鲸鲸" not in block
+    assert "上次" not in block
+    assert "又是这张" not in block
 
 
 def test_media_kind_prefers_qq_sticker_flag_and_keeps_plain_images_plain():
@@ -122,22 +123,27 @@ def test_media_kind_prefers_qq_sticker_flag_and_keeps_plain_images_plain():
     assert classify_media_kind(0, "现实照片，桌上有两杯茶") == "image"
 
 
-def test_familiarity_prompt_labels_repeated_sticker_and_guides_meme_reading():
+@pytest.mark.parametrize("seen_count", [1, 2, 3, 6, 60])
+def test_familiarity_prompt_labels_repeated_sticker_and_guides_meme_reading(seen_count):
     block = format_media_familiarity_block(
         [
             {
                 "caption": "蓝发女仆抱饭碗委屈鼓脸",
                 "media_kind": "sticker",
-                "seen_count": 6,
+                "is_current": True,
+                "seen_count": seen_count,
                 "last_seen_at": 1_790_000_000.0,
                 "last_sender_name": "鲸鲸",
             }
         ],
         now=1_790_000_100.0,
+        include_current=True,
     )
     assert "当前表情包（画面：蓝发女仆抱饭碗委屈鼓脸）" in block
-    assert "按表情包理解" in block
-    assert "不要当成需要考据的插画、照片或陌生新图" in block
+    assert "表达心情、意境和态度的日常用语" in block
+    assert "自然接它的情绪、梗或话题" in block
+    assert "共出现" not in block
+    assert "鲸鲸" not in block
 
 
 def test_image_caption_pairing_keeps_order():
@@ -220,11 +226,13 @@ def test_media_familiarity_is_injected_into_the_current_model_turn(
     assert "【表情熟悉度" in prompt
     assert f"当前{kind_label}（画面：蓝发女仆抱饭碗）" in prompt
     if seen_count >= 2:
-        assert f"共出现 {seen_count} 次" in prompt
-        assert "按表情包理解" in prompt
+        assert "是本会话里熟悉的表情包" in prompt
+        assert "自然接它的情绪、梗或话题" in prompt
     else:
         assert "共出现" not in prompt
-        assert "按表情包理解" not in prompt
+        assert "自然接它的情绪、梗或话题" not in prompt
+    assert "共出现" not in prompt
+    assert "鲸鲸" not in prompt
     assert client._inject_media_familiarity("普通消息", SimpleNamespace()) == "普通消息"
 
 

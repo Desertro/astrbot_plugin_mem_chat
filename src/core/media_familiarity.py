@@ -15,7 +15,6 @@ import hashlib
 import json
 import os
 import re
-import time
 from difflib import SequenceMatcher
 from urllib.parse import unquote, urlparse
 
@@ -492,21 +491,6 @@ def classify_media_kind(sub_type: int = 0, caption: str = "") -> str:
     return "image"
 
 
-def _format_seen_time(timestamp: float, now: float) -> str:
-    if not timestamp:
-        return ""
-    try:
-        then = time.localtime(float(timestamp))
-        today = time.localtime(float(now or time.time()))
-        if (then.tm_year, then.tm_yday) == (today.tm_year, today.tm_yday):
-            return time.strftime("今天 %H:%M", then)
-        if then.tm_year == today.tm_year:
-            return time.strftime("%m月%d日 %H:%M", then)
-        return time.strftime("%Y年%m月%d日 %H:%M", then)
-    except Exception:
-        return ""
-
-
 def _entry_aliases(entry: dict) -> list[str]:
     aliases: list[str] = []
     for raw in entry.get("aliases") or []:
@@ -553,7 +537,6 @@ def format_media_familiarity_block(
     if not selected:
         return ""
 
-    now_ts = float(now or time.time())
     lines = ["【表情熟悉度 · 系统观察，不是台词】"]
     has_repeated = any(entry["_seen_count"] >= 2 for entry in selected)
     has_sticker = False
@@ -566,49 +549,29 @@ def format_media_familiarity_block(
         is_sticker = media_kind == "sticker" or seen_count >= 2
         has_sticker = has_sticker or is_sticker
         kind_label = "表情包" if is_sticker else "图片"
-        when = _format_seen_time(float(entry.get("last_seen_at") or 0.0), now_ts)
-        sender = str(entry.get("last_sender_name") or "").strip()
-        if sender and when:
-            last_seen_text = f"上次由 {sender} 在 {when} 发过"
-        elif when:
-            last_seen_text = f"上次是 {when}"
-        elif sender:
-            last_seen_text = f"上次发送者是 {sender}"
-        else:
-            last_seen_text = ""
         alias_phrase = _format_alias_phrase(aliases)
 
         if seen_count >= 2:
-            frequency = (
-                "高频熟面孔"
-                if seen_count >= 6
-                else ("熟面孔" if seen_count >= 3 else "之前出现过")
-            )
-            suffix = f"；{last_seen_text}" if last_seen_text else ""
             lines.append(
-                f"- 当前{kind_label}{shown_caption}含这次在本会话共出现 "
-                f"{seen_count} 次（{frequency}）{suffix}{alias_phrase}。"
+                f"- 当前{kind_label}{shown_caption}是本会话里熟悉的表情包{alias_phrase}。"
             )
         elif aliases:
             lines.append(f"- 当前{kind_label}{shown_caption}{alias_phrase}。")
         else:
             lines.append(f"- 当前{kind_label}{shown_caption}本会话还没有固定称呼。")
 
-    if has_repeated:
-        lines.append(
-            "- 这些反复出现的图是熟面孔：不要再当成第一次见，也不要每轮重新解释画面或表现得很新奇。"
-        )
     if has_sticker:
         lines.append(
-            "- 标成“表情包”的图按表情包理解：优先接它的梗、情绪或态度，不要当成需要考据的插画、照片或陌生新图。"
-        )
-    if any(entry["_seen_count"] >= 6 for entry in selected[:4]):
-        lines.append(
-            "- 高频熟面孔的表情包只是表达心情意境，跟图片实际内容关系不大；"
-            "结合当前聊天理解它传达的情绪和态度，不必按画面字面展开。"
+            "- 表情包是群友表达心情、意境和态度的日常用语，跟图片实际内容关系不大。"
+            "结合前后文理解这次在说什么，自然接它的情绪、梗或话题；熟悉感体现在接得懂、接得顺。"
         )
     if has_repeated:
-        lines.append("- 可以自然地熟人式吐槽。")
+        lines.extend(
+            [
+                "- 可以围绕这次的意思自然地熟人式吐槽。",
+                "- 累计出现次数只帮助认图，不表示今天刷屏，也不代表发送者在重复同一种心情。",
+            ]
+        )
     if alias_learning:
         lines.extend(
             [
@@ -619,7 +582,6 @@ def format_media_familiarity_block(
         )
     lines.extend(
         [
-            "- 吐槽力度看当前气氛；对方在认真说事时，别让“又是这张”抢走正题。",
             "- 不要复述本段系统观察，也不要声称自己能看见未提供的画面细节。",
         ]
     )
