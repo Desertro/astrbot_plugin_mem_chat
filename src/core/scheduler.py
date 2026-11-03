@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -13,6 +14,7 @@ from astrbot.api.star import Context
 from ..db.database import DatabaseManager
 from ..llm.prompt_builder import build_decision_prompt, build_focus_prompt
 from ..llm_client import LLMClient
+from .attention import normalize_focus_control
 from .member_tags import format_sender, load_sender_tags
 from .models import ReplyTask
 from .state import MemChatState
@@ -48,8 +50,244 @@ class Scheduler:
         self._last_send_ts = {}
         self._queued_group_at: set[str] = set()
         self._deferred_focus = {}  # umo -> bool
+        self._deferred_cycles = {}
+        self._cycle_events = {}
+        self._focus_expiry = {}
+        self._attention_versions = defaultdict(int)
+        self._read_air_rounds = {}
+        self._retry_windows = {}
+        self._closed = False
+        self._queue_workers = {}
         self._admin_protocols_cache: str | None = None
         self._affinity_decay_last_ts: dict[str, float] = {}
+
+    def shutdown(self):
+        """Cancel all attention timers when the plugin is unloaded."""
+        self._closed = True
+        for timer in [
+            *self.cycle_timers.values(),
+            *self._focus_expiry.values(),
+            *self._queue_workers.values(),
+        ]:
+            timer.cancel()
+        self.cycle_timers.clear()
+        self._focus_expiry.clear()
+        self._deferred_cycles.clear()
+
+    def _set_group_focus(self, umo, duration, event):
+        """Set a bounded focus window with room for one scheduled check.
+
+        Args:
+            umo: Group conversation scope.
+            duration: Requested remaining seconds.
+            event: Latest event used to resume scheduling.
+        """
+        low, high, _step, base = self._focus_cycle_bounds(umo)
+        delay = self._clamp_float(self.state.get_focus_delay(umo, base), low, high)
+        maximum = self._focus_duration_bounds()[1]
+        duration = min(maximum, max(float(duration), min(delay + 15, maximum)))
+        self.state.set_focus(umo, math.ceil(duration))
+        self._read_air_rounds.pop(umo, None)
+        previous = self._focus_expiry.pop(umo, None)
+        if previous and previous is not asyncio.current_task():
+            previous.cancel()
+        self._cycle_events[umo] = event
+        self._focus_expiry[umo] = asyncio.create_task(
+            self._wait_focus_expiry(umo, self.state.focus_until[umo], event)
+        )
+        logger.info(
+            "[mem_chat] Attention focus scope=%s remaining=%.1fs", umo, duration
+        )
+
+    async def _wait_focus_expiry(self, umo, deadline, event):
+        """Enter gradual read-air cooling at the actual focus deadline.
+
+        Args:
+            umo: Group conversation scope.
+            deadline: Focus deadline owned by this timer.
+            event: Event used for the next cycle.
+        """
+        try:
+            await asyncio.sleep(max(0, deadline - time.time()))
+            if self.state.focus_until.get(umo) != deadline or self._closed:
+                return
+            self._enter_read_air(umo)
+            await self.trigger_view_cycle(umo, "read_air", event, [])
+        finally:
+            if self._focus_expiry.get(umo) is asyncio.current_task():
+                self._focus_expiry.pop(umo, None)
+
+    def _enter_read_air(self, umo):
+        """Start cooling and invalidate any obsolete focus check.
+
+        Args:
+            umo: Group conversation scope.
+        """
+        self.state.focus_until.pop(umo, None)
+        self.state.is_in_focus(umo)
+        self._read_air_rounds[umo] = 0
+        self.state.reset_focus_delay(umo, self._focus_cycle_bounds(umo)[3])
+        expiry = self._focus_expiry.pop(umo, None)
+        if expiry and expiry is not asyncio.current_task():
+            expiry.cancel()
+        if self.state.get_cycle_task_type(umo) == "focus":
+            timer = self.cycle_timers.pop(umo, None)
+            if timer and timer is not asyncio.current_task():
+                timer.cancel()
+            self.state.set_cycle_task_type(umo, None)
+        self._deferred_focus.pop(umo, None)
+
+    def note_attention_call(self, umo, event):
+        """Prioritize an explicit group call without forcing a reply.
+
+        Args:
+            umo: Group conversation scope.
+            event: Incoming event carrying the call origin.
+        """
+        self._attention_versions[umo] += 1
+        self._retry_windows.pop(umo, None)
+        low, high, step, base = self._focus_cycle_bounds(umo)
+        current = self.state.get_focus_delay(umo, base)
+        reduction = self._to_float(self._get_conf("focus_mode_cycle_at_reduce", 20), 20)
+        ratio = self._get_conf("focus_mode_cycle_at_reward_ratio", None)
+        if ratio is not None:
+            reduction = abs(base * self._to_float(ratio, 0))
+        delay = self._step_towards(current, current - abs(reduction), step, low, high)
+        self.state.set_focus_delay(umo, delay, min_val=low)
+        duration = max(
+            self.state.get_focus_remaining_sec(umo), self._focus_duration_bounds()[3]
+        )
+        self._set_group_focus(umo, duration, event)
+        logger.info(
+            "[mem_chat] Attention call scope=%s origin=%s version=%s",
+            umo,
+            getattr(event, "_mem_chat_wake_reason", "platform_at"),
+            self._attention_versions[umo],
+        )
+
+    def _finish_group_turn(self, task, *, replied, sent):
+        """Apply one valid batch's attention control or bounded retry state.
+
+        Args:
+            task: Completed group task with its frozen attention version.
+            replied: Whether generation completed, including intentional silence.
+            sent: Whether visible content was actually sent.
+        """
+        umo = task.umo
+        task.extra_args["attention_finished"] = True
+        if task.extra_args.get("attention_version") != self._attention_versions[umo]:
+            return
+        if not replied:
+            rows = self.state.get_pending_messages(umo)
+            key = tuple(row[0:2] for row in rows)
+            previous, count = self._retry_windows.get(umo, (None, 0))
+            self._retry_windows[umo] = (key, count + 1 if key == previous else 1)
+            return
+        self._retry_windows.pop(umo, None)
+        payload = getattr(task.event, "_mem_chat_last_structured_payload", None) or {}
+        control = normalize_focus_control(
+            payload.get("control"), self._focus_duration_bounds()[2]
+        )
+        action = control.get("action", "keep")
+        if action == "release":
+            self._enter_read_air(umo)
+        else:
+            remaining = self.state.get_focus_remaining_sec(umo)
+            entering = bool(sent and not self.state.is_in_focus(umo))
+            if task.task_type == "at":
+                remaining = max(remaining, self._focus_duration_bounds()[3])
+            elif sent and not self.state.is_in_focus(umo):
+                remaining = self._focus_duration_bounds()[3]
+            if action == "extend":
+                remaining += control["seconds"]
+            if sent and task.task_type == "focus":
+                low, high, step, base = self._focus_cycle_bounds(umo)
+                delay = self._step_towards(
+                    self.state.get_focus_delay(umo, base), high, step, low, high
+                )
+                self.state.set_focus_delay(umo, delay, min_val=low)
+            if remaining > 0 and (
+                action == "extend" or task.task_type == "at" or entering
+            ):
+                self._set_group_focus(umo, remaining, task.event)
+            if task.task_type == "read_air" and not self.state.is_in_focus(umo):
+                self._advance_read_air(umo)
+        logger.info(
+            "[mem_chat] Attention result scope=%s decision=%s action=%s remaining=%.1f reason=%s",
+            umo,
+            "reply" if sent else "silent",
+            action,
+            self.state.get_focus_remaining_sec(umo),
+            control.get("reason", ""),
+        )
+
+    def _advance_read_air(self, umo):
+        """Advance one bounded linear cooling step.
+
+        Args:
+            umo: Group conversation scope.
+        """
+        if umo in self._read_air_rounds:
+            self._read_air_rounds[umo] = min(10000, self._read_air_rounds[umo] + 1)
+
+    async def _rearm_group_cycle(self, umo):
+        """Resume one group timer after the queue drains.
+
+        Args:
+            umo: Group conversation scope.
+        """
+        event = self._cycle_events.get(umo)
+        if not event or self._closed:
+            return
+        rows = self.state.get_pending_messages(umo)
+        retry_key, failures = self._retry_windows.get(umo, (None, 0))
+        if failures >= 3 and retry_key == tuple(row[0:2] for row in rows):
+            logger.warning("[mem_chat] Attention retry budget exhausted for %s", umo)
+            return
+        if umo in self._queued_group_at:
+            return
+        if rows and any(
+            self.state.get_message_meta(umo, row[0]).get("is_directed") for row in rows
+        ):
+            await self.trigger_view_cycle(umo, "at", event, [])
+        elif self.state.is_in_focus(umo):
+            if rows or failures:
+                await self.trigger_view_cycle(umo, "focus", event, [])
+        elif rows or self._read_air_wait_seconds(umo) < self._steady_read_air_wait(umo):
+            await self.trigger_view_cycle(umo, "read_air", event, [])
+
+    def _steady_read_air_wait(self, umo):
+        """Return the configured cold read-air interval.
+
+        Args:
+            umo: Conversation scope.
+
+        Returns:
+            Interval including the group-size multiplier.
+        """
+        return max(
+            5.0, self._to_float(self._get_conf("heartbeat_cycle", 60), 60)
+        ) * self._large_group_multiplier(umo)
+
+    def _prune_group_pending(self, umo):
+        """Expire individual ordinary messages without losing healthy windows.
+
+        Args:
+            umo: Group conversation scope.
+        """
+        ttl = max(180, 2 * self._steady_read_air_wait(umo) + 60)
+        cutoff = time.time() - ttl
+        expired = [
+            row for row in self.state.get_pending_messages(umo) if row[4] < cutoff
+        ]
+        if expired:
+            self.state.consume_pending_messages(umo, expired)
+            logger.info(
+                "[mem_chat] Pending expired scope=%s count=%s ttl=%.0f",
+                umo,
+                len(expired),
+                ttl,
+            )
 
     import random
 
@@ -64,6 +302,10 @@ class Scheduler:
         - READ_AIR: Wait X seconds (config), then submit task.
         """
 
+        if self._closed:
+            return
+        if event and event.get_group_id():
+            self._cycle_events[umo] = event
         if cycle_type == "read_air" and not bool(
             self._get_conf("read_air_enable", True)
         ):
@@ -87,7 +329,9 @@ class Scheduler:
             logger.debug(
                 f"[mem_chat] Skip triggering {cycle_type} for {umo} as it is currently busy."
             )
-            if cycle_type == "focus":
+            if group_batch:
+                self._deferred_cycles[umo] = cycle_type
+            elif cycle_type == "focus":
                 self._deferred_focus[umo] = True
             return
         if self.state.is_processing(umo) and cycle_type == "at":
@@ -124,7 +368,7 @@ class Scheduler:
             elif cycle_type == "focus":
                 # FOCUS: Only restart if this was triggered by an AT message (to apply speed-up/reward)
                 is_at_msg = False
-                for msg in event.get_messages() or []:
+                for msg in [] if group_batch else event.get_messages() or []:
                     if isinstance(msg, At | AtAll):
                         is_at_msg = True
                         break
@@ -207,51 +451,46 @@ class Scheduler:
         self, umo: str, task_type: str, delay: float, event, image_urls
     ):
         restarted = False
+        submitted = False
+        group_batch = bool(event and event.get_group_id())
+        cancelled = False
         try:
             await asyncio.sleep(delay)
 
-            # LOGIC CHECKS BEFORE SUBMISSION
+            group_batch = bool(event and event.get_group_id())
+            if group_batch:
+                self._prune_group_pending(umo)
             if task_type == "read_air":
-                # Check message counts
-                min_msgs = self._read_air_min_messages(umo)
-                max_msgs = int(self._get_conf("decision_msg_count_max", 100))
-                if max_msgs < min_msgs:
-                    max_msgs = min_msgs
-                curr_count = self.state.get_read_air_msg_count(umo)
-
-                if curr_count < min_msgs or curr_count > max_msgs:
-                    group_id = umo.split(":")[-1] if ":" in umo else umo
-                    logger.debug(
-                        f"[mem_chat] Read Air (Group: {group_id}): Message count {curr_count} not in [{min_msgs}, {max_msgs}]. Skipping."
-                    )
-
-                    try:
+                count = (
+                    self.state.get_pending_count(umo)
+                    if group_batch
+                    else self.state.get_read_air_msg_count(umo)
+                )
+                minimum = self._read_air_min_messages(umo)
+                maximum = max(
+                    minimum, int(self._get_conf("decision_msg_count_max", 100))
+                )
+                if count < minimum or (not group_batch and count > maximum):
+                    if group_batch:
+                        self._advance_read_air(umo)
+                        restarted = False
+                    else:
                         self.state.reset_read_air_msg_count(umo)
                         self.state.clear_heartbeat_start(umo)
-                        now_cutoff = time.time()
-                        self.state.set_last_cycle_cutoff(umo, now_cutoff)
-                        self.state.clear_pending_up_to(umo, now_cutoff)
-                    except Exception:
-                        pass
+                        cutoff = time.time()
+                        self.state.set_last_cycle_cutoff(umo, cutoff)
+                        self.state.clear_pending_up_to(umo, cutoff)
                     return
-
-            elif task_type == "focus":
-                # Check if still in focus
-                if not self.state.is_in_focus(umo):
-                    logger.info(
-                        f"[mem_chat] Focus mode expired for {umo}. Switching to Read Air."
-                    )
+            elif task_type == "focus" and not self.state.is_in_focus(umo):
+                if group_batch:
+                    if umo not in self._read_air_rounds:
+                        self._enter_read_air(umo)
+                else:
                     self.state.set_cycle_task_type(umo, None)
-                    cycle_min, cycle_max, _cycle_step_max, base_delay = (
-                        self._focus_cycle_bounds(umo)
-                    )
-                    base_delay = self._clamp_float(base_delay, cycle_min, cycle_max)
-                    self.state.reset_focus_delay(
-                        umo, default=base_delay
-                    )  # Reset delay for next time
+                    self.state.reset_focus_delay(umo, self._focus_cycle_bounds(umo)[3])
                     await self.trigger_view_cycle(umo, "read_air", event, [])
                     restarted = True
-                    return
+                return
 
             # Create Task
             prio = 10
@@ -271,7 +510,8 @@ class Scheduler:
             )
 
             await self.add_task(task)
-            if task_type == "read_air":
+            submitted = True
+            if task_type == "read_air" and not group_batch:
                 try:
                     self.state.reset_read_air_msg_count(umo)
                     self.state.clear_heartbeat_start(umo)
@@ -279,6 +519,7 @@ class Scheduler:
                     pass
 
         except asyncio.CancelledError:
+            cancelled = True
             logger.debug(f"[mem_chat] Cycle {task_type} for {umo} cancelled.")
         finally:
             if not restarted:
@@ -289,6 +530,8 @@ class Scheduler:
                     if self.state.get_cycle_task_type(umo) == task_type:
                         self.state.set_cycle_task_type(umo, None)
                     self.cycle_timers.pop(umo, None)
+                    if group_batch and not submitted and not cancelled:
+                        await self._rearm_group_cycle(umo)
 
     def _get_full_text(self, event: AstrMessageEvent) -> str:
         try:
@@ -426,15 +669,24 @@ class Scheduler:
         return self._clamp_float(multiplier, 1.0, 5.0)
 
     def _read_air_wait_seconds(self, umo: str) -> float:
-        try:
-            base = float(self._get_conf("heartbeat_cycle", 60) or 60)
-        except Exception:
-            base = 60.0
-        if base < 5:
-            base = 5.0
-        return base * self._large_group_multiplier(umo)
+        maximum = self._steady_read_air_wait(umo)
+        if umo not in self._read_air_rounds:
+            return maximum
+        start = max(
+            1.0, self._to_float(self._get_conf("read_air_transition_start_sec", 20), 20)
+        )
+        step = max(
+            1.0, self._to_float(self._get_conf("read_air_transition_step_sec", 20), 20)
+        )
+        return min(
+            maximum,
+            (start + self._read_air_rounds[umo] * step)
+            * self._large_group_multiplier(umo),
+        )
 
     def _read_air_min_messages(self, umo: str) -> int:
+        if self._read_air_wait_seconds(umo) < self._steady_read_air_wait(umo):
+            return 1
         try:
             base = int(self._get_conf("decision_msg_count_min", 1) or 1)
         except Exception:
@@ -452,16 +704,7 @@ class Scheduler:
         return max(1, base + bonus)
 
     def _cap_focus_duration(self, umo: str, duration: int) -> int:
-        if self._large_group_multiplier(umo) <= 1.0:
-            return max(1, int(duration))
-        cap = int(
-            self._to_float(
-                self._get_conf("large_group_focus_duration_cap_sec", 45), 45.0
-            )
-        )
-        if cap > 0:
-            return max(1, min(int(duration), cap))
-        return max(1, int(duration))
+        return max(1, min(int(duration), self._focus_duration_bounds()[1]))
 
     def _large_group_decision_note(self, umo: str) -> str:
         if self._large_group_multiplier(umo) <= 1.0:
@@ -1121,8 +1364,12 @@ class Scheduler:
             f"[mem_chat] Stage start: {stage} task={task.task_type} umo={task.umo} timeout={timeout_text}"
         )
         try:
+            if self._get_task_timeout_sec(task.task_type) > 0 and remaining <= 0:
+                if hasattr(awaitable, "close"):
+                    awaitable.close()
+                raise asyncio.TimeoutError("Reply task budget exhausted")
             if remaining > 0:
-                result = await asyncio.wait_for(awaitable, timeout=max(1.0, remaining))
+                result = await asyncio.wait_for(awaitable, timeout=remaining)
             else:
                 result = await awaitable
             dur = time.time() - start
@@ -1149,11 +1396,14 @@ class Scheduler:
                 return
             self._queued_group_at.add(task.umo)
         await self.task_queues[task.umo].put(task)
-        if task.umo not in self.active_queues:
-            asyncio.create_task(self._process_reply_queue(task.umo))
+        worker = self._queue_workers.get(task.umo)
+        if task.umo not in self.active_queues and (worker is None or worker.done()):
+            self._queue_workers[task.umo] = asyncio.create_task(
+                self._process_reply_queue(task.umo)
+            )
 
     async def _process_reply_queue(self, umo):
-        if umo in self.active_queues:
+        if umo in self.active_queues or self._closed:
             return
         self.active_queues.add(umo)
         logger.info(f"[mem_chat] Queue processor started for {umo}")
@@ -1168,6 +1418,9 @@ class Scheduler:
                 if task.task_type == "at":
                     self._queued_group_at.discard(umo)
                 group_batch = bool(task.event and task.event.get_group_id())
+                if group_batch:
+                    self._cycle_events[umo] = task.event
+                    task.extra_args["attention_version"] = self._attention_versions[umo]
                 try:
                     # Check timeout
                     timeout_sec = self._get_task_timeout_sec(task.task_type)
@@ -1209,6 +1462,8 @@ class Scheduler:
                                     continue
 
                     # Freeze the cycle before any awaited context or model work.
+                    if group_batch:
+                        self._prune_group_pending(umo)
                     cycle_cutoff_ts = time.time()
                     pending_snapshot = self.state.get_pending_messages(umo)
                     pending_snapshot = [
@@ -1502,62 +1757,75 @@ class Scheduler:
                                 history_msgs=history_msgs,
                             )
 
-                        dur_min, dur_max, dur_step_max, dur_base = (
-                            self._focus_duration_bounds()
-                        )
-                        cycle_min, _cycle_max, _cycle_step_max, _base_delay = (
-                            self._focus_cycle_bounds()
-                        )
-                        remaining = float(self.state.get_focus_remaining_sec(umo))
-                        at_extend_base = max(1, int(cycle_min or 1))
-                        at_extend_cap = max(1, int(dur_step_max))
-                        decay = 1.0
-                        if dur_max > 0:
-                            decay = 1.0 - (remaining / float(dur_max))
-                        decay = self._clamp_float(decay, 0.35, 1.0)
-                        focus_at_extend = int(
-                            max(
-                                1,
-                                min(float(at_extend_base), float(at_extend_cap))
-                                * decay,
+                        if group_batch:
+                            if replied:
+                                self.state.consume_pending_messages(umo, raw_pending)
+                            if sent:
+                                self._last_send_ts[umo] = time.time()
+                            self._finish_group_turn(
+                                task, replied=bool(replied), sent=sent
                             )
-                        )
-                        remaining_int = int(remaining) + (
-                            1 if (remaining - int(remaining)) > 0 else 0
-                        )
-                        focus_duration = (
-                            max(int(dur_base), remaining_int) + focus_at_extend
-                        )
-                        if focus_duration < dur_min:
-                            focus_duration = dur_min
-                        elif focus_duration > dur_max:
-                            focus_duration = dur_max
-                        if replied and send_ok:
-                            self.state.set_focus(umo, focus_duration)
-                        if replied:
-                            consume_ts = time.time()
-                            self.state.consume_pending_messages(umo, raw_pending)
-                            if send_ok:
-                                self._last_send_ts[umo] = consume_ts
-                                logger.info(
-                                    f"[mem_chat] AT phase finished for {umo}. Refreshed Focus Mode (Duration: {focus_duration}s, +{focus_at_extend}s)."
+                        else:
+                            dur_min, dur_max, dur_step_max, dur_base = (
+                                self._focus_duration_bounds()
+                            )
+                            cycle_min, _cycle_max, _cycle_step_max, _base_delay = (
+                                self._focus_cycle_bounds()
+                            )
+                            remaining = float(self.state.get_focus_remaining_sec(umo))
+                            at_extend_base = max(1, int(cycle_min or 1))
+                            at_extend_cap = max(1, int(dur_step_max))
+                            decay = 1.0
+                            if dur_max > 0:
+                                decay = 1.0 - (remaining / float(dur_max))
+                            decay = self._clamp_float(decay, 0.35, 1.0)
+                            focus_at_extend = int(
+                                max(
+                                    1,
+                                    min(float(at_extend_base), float(at_extend_cap))
+                                    * decay,
                                 )
+                            )
+                            remaining_int = int(remaining) + (
+                                1 if (remaining - int(remaining)) > 0 else 0
+                            )
+                            focus_duration = (
+                                max(int(dur_base), remaining_int) + focus_at_extend
+                            )
+                            if focus_duration < dur_min:
+                                focus_duration = dur_min
+                            elif focus_duration > dur_max:
+                                focus_duration = dur_max
+                            if replied and send_ok:
+                                self.state.set_focus(umo, focus_duration)
+                            if replied:
+                                consume_ts = time.time()
+                                self.state.consume_pending_messages(umo, raw_pending)
+                                if send_ok:
+                                    self._last_send_ts[umo] = consume_ts
+                                    logger.info(
+                                        f"[mem_chat] AT phase finished for {umo}. Refreshed Focus Mode (Duration: {focus_duration}s, +{focus_at_extend}s)."
+                                    )
+                                else:
+                                    logger.info(
+                                        f"[mem_chat] AT phase consumed messages without sending for {umo}; Focus Mode not refreshed."
+                                    )
                             else:
                                 logger.info(
-                                    f"[mem_chat] AT phase consumed messages without sending for {umo}; Focus Mode not refreshed."
+                                    f"[mem_chat] AT phase failed/interrupted for {umo}. Focus Mode still active. Messages retained in pending."
                                 )
-                        else:
-                            logger.info(
-                                f"[mem_chat] AT phase failed/interrupted for {umo}. Focus Mode still active. Messages retained in pending."
-                            )
-                            if self.state.is_in_focus(umo):
-                                self._deferred_focus[umo] = True
+                                if self.state.is_in_focus(umo):
+                                    self._deferred_focus[umo] = True
 
-                        deferred_focus = self._deferred_focus.pop(umo, False)
-                        if replied and self.state.is_in_focus(umo):
-                            await self.trigger_view_cycle(umo, "focus", task.event, [])
-                        elif deferred_focus and self.state.is_in_focus(umo):
-                            await self.trigger_view_cycle(umo, "focus", task.event, [])
+                            deferred_focus = self._deferred_focus.pop(umo, False)
+                            if replied and self.state.is_in_focus(umo):
+                                await self.trigger_view_cycle(
+                                    umo, "focus", task.event, []
+                                )
+                            elif deferred_focus and self.state.is_in_focus(umo):
+                                await self.trigger_view_cycle(
+                                    umo, "focus", task.event, []
+                                )
 
                     elif task.task_type == "focus" or task.task_type == "read_air":
                         raw_pending = list(pending_snapshot)
@@ -1598,6 +1866,8 @@ class Scheduler:
                                 ),
                             )
                         )
+                        if group_batch:
+                            stale_sec = 0
                         if stale_sec > 0:
                             cutoff = now_ts - stale_sec
                             if raw_pending and raw_pending[-1][4] < cutoff:
@@ -2029,76 +2299,96 @@ class Scheduler:
                             logger.info(
                                 f"[mem_chat] {task.task_type.upper()} task failed/interrupted for {umo}. Messages retained in pending."
                             )
-                            if task.task_type == "focus" and self.state.is_in_focus(
-                                umo
+                            if (
+                                not group_batch
+                                and task.task_type == "focus"
+                                and self.state.is_in_focus(umo)
                             ):
                                 self._deferred_focus[umo] = True
 
-                        # Only a real sent reply can start focus mode.
-                        if task.task_type == "read_air" and sent:
-                            dur_min, dur_max, _dur_step_max, dur_base = (
-                                self._focus_duration_bounds()
+                        if group_batch:
+                            self._finish_group_turn(
+                                task, replied=bool(replied), sent=sent
                             )
-                            focus_duration = int(dur_base)
-                            if focus_duration < dur_min:
-                                focus_duration = dur_min
-                            elif focus_duration > dur_max:
-                                focus_duration = dur_max
-                            focus_duration = self._cap_focus_duration(
-                                umo, focus_duration
-                            )
-                            self.state.set_focus(
-                                umo, focus_duration
-                            )  # This sets state to FOCUS
-                            logger.info(
-                                f"[mem_chat] Read Air triggered reply. Entering Focus Mode (Duration: {focus_duration}s)."
-                            )
-
-                        # If focus mode task completed with a real send, apply cooling
-                        if sent:
-                            cycle_min, cycle_max, cycle_step_max, base_delay = (
-                                self._focus_cycle_bounds(umo)
-                            )
-
-                            if task.task_type == "focus":
-                                curr_delay = self.state.get_focus_delay(
-                                    umo, default=base_delay
+                        else:
+                            # Only a real sent reply can start focus mode.
+                            if task.task_type == "read_air" and sent:
+                                dur_min, dur_max, _dur_step_max, dur_base = (
+                                    self._focus_duration_bounds()
                                 )
-                                next_delay = self._step_towards(
-                                    float(curr_delay),
-                                    float(cycle_max),
-                                    float(cycle_step_max),
-                                    float(cycle_min),
-                                    float(cycle_max),
+                                focus_duration = int(dur_base)
+                                if focus_duration < dur_min:
+                                    focus_duration = dur_min
+                                elif focus_duration > dur_max:
+                                    focus_duration = dur_max
+                                focus_duration = self._cap_focus_duration(
+                                    umo, focus_duration
                                 )
-                                self.state.set_focus_delay(
-                                    umo, next_delay, min_val=cycle_min
-                                )
+                                self.state.set_focus(
+                                    umo, focus_duration
+                                )  # This sets state to FOCUS
                                 logger.info(
-                                    f"[mem_chat] FOCUS reply applied. Next focus delay set to {self.state.get_focus_delay(umo, default=base_delay):.2f}s."
+                                    f"[mem_chat] Read Air triggered reply. Entering Focus Mode (Duration: {focus_duration}s)."
                                 )
 
-                        if replied and self.state.is_in_focus(umo):
-                            await self.trigger_view_cycle(umo, "focus", task.event, [])
-                        elif self._deferred_focus.pop(
-                            umo, False
-                        ) and self.state.is_in_focus(umo):
-                            await self.trigger_view_cycle(umo, "focus", task.event, [])
+                            # If focus mode task completed with a real send, apply cooling
+                            if sent:
+                                cycle_min, cycle_max, cycle_step_max, base_delay = (
+                                    self._focus_cycle_bounds(umo)
+                                )
 
-                        # Note: Next cycle triggering is now handled in finally block of _cycle_wait_and_submit
-                        # via trigger_view_cycle which checks state.
+                                if task.task_type == "focus":
+                                    curr_delay = self.state.get_focus_delay(
+                                        umo, default=base_delay
+                                    )
+                                    next_delay = self._step_towards(
+                                        float(curr_delay),
+                                        float(cycle_max),
+                                        float(cycle_step_max),
+                                        float(cycle_min),
+                                        float(cycle_max),
+                                    )
+                                    self.state.set_focus_delay(
+                                        umo, next_delay, min_val=cycle_min
+                                    )
+                                    logger.info(
+                                        f"[mem_chat] FOCUS reply applied. Next focus delay set to {self.state.get_focus_delay(umo, default=base_delay):.2f}s."
+                                    )
+
+                            if replied and self.state.is_in_focus(umo):
+                                await self.trigger_view_cycle(
+                                    umo, "focus", task.event, []
+                                )
+                            elif self._deferred_focus.pop(
+                                umo, False
+                            ) and self.state.is_in_focus(umo):
+                                await self.trigger_view_cycle(
+                                    umo, "focus", task.event, []
+                                )
+
+                            # Note: Next cycle triggering is now handled in finally block of _cycle_wait_and_submit
+                            # via trigger_view_cycle which checks state.
 
                 except Exception as e:
                     logger.exception(
                         f"[mem_chat] Task execution failed: type={type(e).__name__} umo={getattr(task, 'umo', None)} task_type={getattr(task, 'task_type', None)} error={e}"
                     )
                 finally:
+                    if (
+                        group_batch
+                        and self.state.get_pending_count(umo)
+                        and not task.extra_args.get("attention_finished")
+                    ):
+                        self._finish_group_turn(task, replied=False, sent=False)
                     queue.task_done()
 
         finally:
             self.active_queues.discard(umo)
             logger.info(f"[mem_chat] Queue processor stopped for {umo}")
-            if self._deferred_focus.pop(umo, False) and self.state.is_in_focus(umo):
+            if umo in self._cycle_events:
+                self._deferred_cycles.pop(umo, None)
+                await self._rearm_group_cycle(umo)
+            elif self._deferred_focus.pop(umo, False) and self.state.is_in_focus(umo):
                 await self.trigger_view_cycle(umo, "focus", task.event, [])
 
     async def _get_conversation(self, event: AstrMessageEvent):

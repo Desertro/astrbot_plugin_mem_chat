@@ -1178,7 +1178,7 @@
     "description": "大群专注模式时长上限（秒）",
     "type": "int",
     "default": 45,
-    "hint": "防止一次读空气回复后在人多群里持续高频接话。"
+    "hint": "已弃用：专注时长由默认窗口和模型 focus 控制决定，大群主要通过周期倍率降低频率。"
   },
   "meme_vision": {
     "type": "object",
@@ -1227,5 +1227,27 @@
       }
     },
     "hint": "用于图片描述、存表情识别和发送前视觉复核；关闭时沿用旧模型配置。"
+  },
+  "attention_names": {
+    "type": "list",
+    "description": "群聊名称呼唤候选词",
+    "items": {
+      "type": "string"
+    },
+    "default": [
+      "爱丽丝",
+      "天童爱丽丝"
+    ],
+    "hint": "仅检测发送者本条文字；名称命中走 @ 快速判断通道，模型仍可选择不回复。"
+  },
+  "read_air_transition_start_sec": {
+    "type": "int",
+    "description": "专注结束后首轮读空气等待（秒）",
+    "default": 20
+  },
+  "read_air_transition_step_sec": {
+    "type": "int",
+    "description": "降温每轮增加的等待（秒）",
+    "default": 20
   }
 }

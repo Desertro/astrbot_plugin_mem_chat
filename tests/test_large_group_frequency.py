@@ -34,7 +34,7 @@ def test_large_group_slows_read_air_and_raises_message_threshold():
 
     assert scheduler._read_air_wait_seconds(umo) == 540
     assert scheduler._read_air_min_messages(umo) == 10
-    assert scheduler._cap_focus_duration(umo, 100) == 45
+    assert scheduler._cap_focus_duration(umo, 100) == 100
     assert scheduler._large_group_decision_note(umo)
 
     cycle_min, cycle_max, _step, base = scheduler._focus_cycle_bounds(umo)

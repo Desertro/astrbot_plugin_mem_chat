@@ -317,3 +317,54 @@ async def test_mentions_arriving_during_generation_form_one_following_batch(sche
     assert windows == [["a"], ["b", "c"]]
     assert scheduler.state.get_pending_count(UMO) == 0
     assert UMO not in scheduler._queued_group_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["at", "focus", "read_air"])
+async def test_attention_controller_survives_complete_silent_batch(scheduler, lane):
+    add_message(scheduler.state, "a", "waiting for next image", directed=lane == "at")
+    event = Event()
+    scheduler.state.set_focus_delay(UMO, 10)
+    scheduler.state.set_focus(UMO, 40)
+
+    async def invoke(*args, **kwargs):
+        kwargs["event"]._mem_chat_last_send_ok = False
+        kwargs["event"]._mem_chat_last_structured_payload = {
+            "control": {
+                "decision": "no_reply",
+                "focus": {"action": "extend", "seconds": 90},
+            },
+            "response": {},
+        }
+        return True
+
+    scheduler.llm_client.invoke_llm.side_effect = invoke
+    try:
+        await scheduler.task_queues[UMO].put(ReplyTask(UMO, 0, lane, event=event))
+        await scheduler._process_reply_queue(UMO)
+        assert scheduler.state.get_pending_count(UMO) == 0
+        assert scheduler.state.get_focus_remaining_sec(UMO) >= 129
+        assert UMO not in scheduler._last_send_ts
+    finally:
+        scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_complete_release_batch_starts_short_read_air_cycle(scheduler):
+    add_message(scheduler.state, "a", "goodbye")
+    event = Event()
+
+    async def invoke(*args, **kwargs):
+        kwargs["event"]._mem_chat_last_send_ok = True
+        kwargs["event"]._mem_chat_last_structured_payload = {
+            "control": {"decision": "reply_only", "focus": {"action": "release"}},
+            "response": {"text": "goodbye"},
+        }
+        return True
+
+    scheduler.llm_client.invoke_llm.side_effect = invoke
+    await scheduler.task_queues[UMO].put(ReplyTask(UMO, 0, "focus", event=event))
+    await scheduler._process_reply_queue(UMO)
+    assert not scheduler.state.is_in_focus(UMO)
+    assert scheduler._read_air_wait_seconds(UMO) == 20
+    assert scheduler.trigger_view_cycle.await_args.args[1] == "read_air"

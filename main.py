@@ -35,6 +35,7 @@ BLOCKED_PATCH_TOKENS = (
 )
 
 try:
+    from .src.core.attention import detect_name_call
     from .src.core.codex_service import CodexService
     from .src.core.media_familiarity import (
         analyze_recent_media_occurrences,
@@ -55,6 +56,7 @@ except ImportError:
     _base_dir = os.path.dirname(__file__)
     if _base_dir and _base_dir not in sys.path:
         sys.path.insert(0, _base_dir)
+    from src.core.attention import detect_name_call
     from src.core.codex_service import CodexService
     from src.core.media_familiarity import (
         analyze_recent_media_occurrences,
@@ -1179,7 +1181,9 @@ class MemChat(Star):
             self.db_mgr.close()
 
     async def terminate(self):
-        """Cancel scene timers cleanly when AstrBot reloads/unloads the plugin."""
+        """Cancel timers cleanly when AstrBot reloads or unloads the plugin."""
+        if hasattr(self, "scheduler"):
+            self.scheduler.shutdown()
         try:
             if hasattr(self, "scene_engine") and self.scene_engine:
                 self.scene_engine.shutdown()
@@ -2457,6 +2461,19 @@ class MemChat(Star):
         if not event.get_group_id():
             is_at = True
 
+        wake_reason = "platform_at" if is_at else "ordinary"
+        if (
+            event.get_group_id()
+            and not is_at
+            and detect_name_call(
+                event.get_messages(),
+                self.config.get("attention_names", ["爱丽丝", "天童爱丽丝"]),
+            )
+        ):
+            is_at = True
+            wake_reason = "name_call"
+        event._mem_chat_wake_reason = wake_reason
+
         try:
             setattr(event, "is_at_or_wake_command", is_at)
         except Exception:
@@ -2796,123 +2813,133 @@ class MemChat(Star):
             # Event: AT
             # Action: Interrupt, (If already in focus: wait focus cycle; else: reply soon), Enter/Refresh Focus
 
-            was_in_focus = False
-            try:
-                was_in_focus = bool(self.state.is_in_focus(umo))
-            except Exception:
+            if event.get_group_id():
+                self.scheduler.note_attention_call(umo, event)
+                was_in_focus = self.state.is_in_focus(umo)
+            else:
                 was_in_focus = False
-
-            def _to_float(v, d):
                 try:
-                    return float(v)
+                    was_in_focus = bool(self.state.is_in_focus(umo))
                 except Exception:
-                    return float(d)
+                    was_in_focus = False
 
-            def _clamp(v, lo, hi):
-                if hi < lo:
-                    hi = lo
-                if v < lo:
-                    return lo
-                if v > hi:
-                    return hi
-                return v
+                def _to_float(v, d):
+                    try:
+                        return float(v)
+                    except Exception:
+                        return float(d)
 
-            def _step_towards(curr, target, step_max, lo, hi):
-                curr = _clamp(curr, lo, hi)
-                target = _clamp(target, lo, hi)
-                step_max = max(0.0, float(step_max))
+                def _clamp(v, lo, hi):
+                    if hi < lo:
+                        hi = lo
+                    if v < lo:
+                        return lo
+                    if v > hi:
+                        return hi
+                    return v
+
+                def _step_towards(curr, target, step_max, lo, hi):
+                    curr = _clamp(curr, lo, hi)
+                    target = _clamp(target, lo, hi)
+                    step_max = max(0.0, float(step_max))
+                    if step_max <= 0:
+                        return target
+                    delta = target - curr
+                    if abs(delta) <= step_max:
+                        return target
+                    return curr + (step_max if delta > 0 else -step_max)
+
+                base_delay = _to_float(self.config.get("focus_mode_cycle", 15), 15)
+                min_delay = _to_float(
+                    self.config.get(
+                        "focus_cycle_min_sec",
+                        self.config.get("focus_mode_cycle_min", 10),
+                    ),
+                    min(10.0, base_delay),
+                )
+                max_delay = _to_float(
+                    self.config.get("focus_cycle_max_sec", base_delay + 20.0),
+                    base_delay + 20.0,
+                )
+                step_max = _to_float(
+                    self.config.get("focus_cycle_step_max_sec", 20),
+                    20.0,
+                )
+                if min_delay < 1:
+                    min_delay = 1.0
+                if max_delay < min_delay:
+                    max_delay = min_delay
                 if step_max <= 0:
-                    return target
-                delta = target - curr
-                if abs(delta) <= step_max:
-                    return target
-                return curr + (step_max if delta > 0 else -step_max)
+                    step_max = max_delay - min_delay
+                base_delay = _clamp(base_delay, min_delay, max_delay)
+                reward_ratio = self.config.get("focus_mode_cycle_at_reward_ratio", None)
+                at_reduce = float(self.config.get("focus_mode_cycle_at_reduce", 20))
+                try:
+                    reward_ratio = (
+                        float(reward_ratio) if reward_ratio is not None else None
+                    )
+                except Exception:
+                    reward_ratio = None
+                if reward_ratio is None:
+                    reward_ratio = (at_reduce / base_delay) if base_delay > 0 else 0.0
 
-            base_delay = _to_float(self.config.get("focus_mode_cycle", 15), 15)
-            min_delay = _to_float(
-                self.config.get(
-                    "focus_cycle_min_sec",
-                    self.config.get("focus_mode_cycle_min", 10),
-                ),
-                min(10.0, base_delay),
-            )
-            max_delay = _to_float(
-                self.config.get("focus_cycle_max_sec", base_delay + 20.0),
-                base_delay + 20.0,
-            )
-            step_max = _to_float(
-                self.config.get("focus_cycle_step_max_sec", 20),
-                20.0,
-            )
-            if min_delay < 1:
-                min_delay = 1.0
-            if max_delay < min_delay:
-                max_delay = min_delay
-            if step_max <= 0:
-                step_max = max_delay - min_delay
-            base_delay = _clamp(base_delay, min_delay, max_delay)
-            reward_ratio = self.config.get("focus_mode_cycle_at_reward_ratio", None)
-            at_reduce = float(self.config.get("focus_mode_cycle_at_reduce", 20))
-            try:
-                reward_ratio = float(reward_ratio) if reward_ratio is not None else None
-            except Exception:
-                reward_ratio = None
-            if reward_ratio is None:
-                reward_ratio = (at_reduce / base_delay) if base_delay > 0 else 0.0
+                if umo not in self.state.focus_delays:
+                    self.state.set_focus_delay(umo, base_delay, min_val=min_delay)
+                curr_delay = self.state.get_focus_delay(umo, default=base_delay)
+                target_delay = float(curr_delay) - abs(base_delay * reward_ratio)
+                next_delay = _step_towards(
+                    float(curr_delay), target_delay, step_max, min_delay, max_delay
+                )
+                self.state.set_focus_delay(umo, next_delay, min_val=min_delay)
 
-            if umo not in self.state.focus_delays:
-                self.state.set_focus_delay(umo, base_delay, min_val=min_delay)
-            curr_delay = self.state.get_focus_delay(umo, default=base_delay)
-            target_delay = float(curr_delay) - abs(base_delay * reward_ratio)
-            next_delay = _step_towards(
-                float(curr_delay), target_delay, step_max, min_delay, max_delay
-            )
-            self.state.set_focus_delay(umo, next_delay, min_val=min_delay)
-
-            # Enter/Refresh Focus State
-            focus_duration = int(
-                _to_float(self.config.get("focus_duration_sec", 100), 100)
-            )
-            focus_min = int(
-                _to_float(self.config.get("focus_duration_min_sec", 60), 60)
-            )
-            focus_max = int(
-                _to_float(self.config.get("focus_duration_max_sec", 900), 900)
-            )
-            focus_step_max = int(
-                _to_float(self.config.get("focus_duration_step_max_sec", 120), 120)
-            )
-            if focus_min < 1:
-                focus_min = 1
-            if focus_max < focus_min:
-                focus_max = focus_min
-            if focus_step_max <= 0:
-                focus_step_max = max(1, focus_max - focus_min)
-            focus_duration = int(
-                _clamp(float(focus_duration), float(focus_min), float(focus_max))
-            )
-            remaining = (
-                float(self.state.get_focus_remaining_sec(umo)) if was_in_focus else 0.0
-            )
-            # @ 奖励续期：在现有剩余专注时长基础上做增量，避免每次都重置为固定值。
-            # 剩余时长越高，单次增量越小，防止高频 @ 将专注时长无限堆到上限。
-            at_extend_base = max(1, int(min_delay or 1))
-            at_extend_cap = max(1, int(focus_step_max))
-            decay = 1.0
-            if focus_max > 0:
-                decay = 1.0 - (remaining / float(focus_max))
-            decay = _clamp(decay, 0.35, 1.0)
-            focus_at_extend = int(
-                max(1, min(float(at_extend_base), float(at_extend_cap)) * decay)
-            )
-            remaining_int = int(remaining) + (
-                1 if (remaining - int(remaining)) > 0 else 0
-            )
-            target_duration = max(int(focus_duration), remaining_int) + focus_at_extend
-            target_duration = int(
-                _clamp(float(target_duration), float(focus_min), float(focus_max))
-            )
-            self.state.set_focus(umo, target_duration)
+                # Enter/Refresh Focus State
+                focus_duration = int(
+                    _to_float(self.config.get("focus_duration_sec", 100), 100)
+                )
+                focus_min = int(
+                    _to_float(self.config.get("focus_duration_min_sec", 60), 60)
+                )
+                focus_max = int(
+                    _to_float(self.config.get("focus_duration_max_sec", 900), 900)
+                )
+                focus_step_max = int(
+                    _to_float(self.config.get("focus_duration_step_max_sec", 120), 120)
+                )
+                if focus_min < 1:
+                    focus_min = 1
+                if focus_max < focus_min:
+                    focus_max = focus_min
+                if focus_step_max <= 0:
+                    focus_step_max = max(1, focus_max - focus_min)
+                focus_duration = int(
+                    _clamp(float(focus_duration), float(focus_min), float(focus_max))
+                )
+                remaining = (
+                    float(self.state.get_focus_remaining_sec(umo))
+                    if was_in_focus
+                    else 0.0
+                )
+                # @ 奖励续期：在现有剩余专注时长基础上做增量，避免每次都重置为固定值。
+                # 剩余时长越高，单次增量越小，防止高频 @ 将专注时长无限堆到上限。
+                at_extend_base = max(1, int(min_delay or 1))
+                at_extend_cap = max(1, int(focus_step_max))
+                decay = 1.0
+                if focus_max > 0:
+                    decay = 1.0 - (remaining / float(focus_max))
+                decay = _clamp(decay, 0.35, 1.0)
+                focus_at_extend = int(
+                    max(1, min(float(at_extend_base), float(at_extend_cap)) * decay)
+                )
+                remaining_int = int(remaining) + (
+                    1 if (remaining - int(remaining)) > 0 else 0
+                )
+                target_duration = (
+                    max(int(focus_duration), remaining_int) + focus_at_extend
+                )
+                target_duration = int(
+                    _clamp(float(target_duration), float(focus_min), float(focus_max))
+                )
+                self.state.set_focus(umo, target_duration)
 
             # Prevent Core Reply
             try:

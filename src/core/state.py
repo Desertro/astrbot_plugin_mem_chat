@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import random
 import time
 from collections.abc import Callable
@@ -738,8 +739,23 @@ class MemChatState:
             buf = []
             self.pending_msgs[umo] = buf
         buf.append((mid, mtxt, sname, sid, now))
-        if len(buf) > 50:
-            buf.pop(0)
+        if len(buf) > 50 and ":GroupMessage:" not in umo:
+            self.pending_msgs[umo] = buf[-50:]
+        elif len(buf) > 50:
+            directed = [
+                row
+                for row in buf
+                if self.get_message_meta(umo, row[0]).get("is_directed")
+            ]
+            background = [row for row in buf if row not in directed]
+            retained = set(directed[-100:] + background[-50:])
+            self.pending_msgs[umo] = [row for row in buf if row in retained]
+            if len(directed) > 100:
+                logging.getLogger("astrbot").warning(
+                    "[mem_chat] Directed pending overflow for %s: dropped=%s",
+                    umo,
+                    len(directed) - 100,
+                )
 
     def get_last_message(self, umo: str):
         return self.last_msg.get(umo)

@@ -5814,6 +5814,28 @@ class LLMClient:
             except Exception:
                 pass
 
+        if event is not None and event.get_group_id():
+            state = self.plugin.state
+            phase = "focus" if state.is_in_focus(umo) else "read_air"
+            origin = getattr(event, "_mem_chat_wake_reason", "ordinary")
+            scheduler = self.plugin.scheduler
+            delay = (
+                state.get_focus_delay(umo, scheduler._focus_cycle_bounds(umo)[3])
+                if phase == "focus"
+                else scheduler._read_air_wait_seconds(umo)
+            )
+            prompt += (
+                "\n\n【注意力调度】\n"
+                f"当前阶段：{phase}；focus 剩余 {state.get_focus_remaining_sec(umo):.0f} 秒；"
+                f"当前检查间隔约 {delay:.0f} 秒；本轮触发来源：{origin}。\n"
+                '可选 control.focus={"action":"extend","seconds":90,"reason":"简短原因"}，'
+                "action 支持 keep / extend / release；不填则保持默认计时。"
+                "有人还在补充、问题没有说完，或你想继续留意时可以延长 focus；"
+                "不想接这轮可以 no_reply，同时延长关注等后续。话题结束可自然到期或 release。"
+                "名称呼唤只是可能在叫你，结合本轮上下文判断；不代表必须回复或执行动作。"
+                "这些控制字段不属于聊天正文。"
+            )
+
         # 1. Timeout Check
         timeout_sec = self._get_task_timeout_sec(task_type)
         if (
