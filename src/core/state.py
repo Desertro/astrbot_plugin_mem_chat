@@ -60,6 +60,7 @@ class MemChatState:
     def get_last_mood(self, umo: str) -> str:
         if not umo:
             return ""
+        self.get_last_mood_state(umo)
         v = self.last_moods.get(umo)
         return str(v or "").strip()
 
@@ -78,6 +79,7 @@ class MemChatState:
         if exp > 0 and self._now() >= exp:
             self.last_mood_states[umo] = "中性"
             self.mood_state_expires_at.pop(umo, None)
+            self.clear_last_mood(umo)
         v = self.last_mood_states.get(umo)
         return str(v or "").strip()
 
@@ -119,6 +121,7 @@ class MemChatState:
         if remain <= 0:
             self.mood_state_expires_at.pop(umo, None)
             self.last_mood_states[umo] = "中性"
+            self.clear_last_mood(umo)
             return 0.0
         return remain
 

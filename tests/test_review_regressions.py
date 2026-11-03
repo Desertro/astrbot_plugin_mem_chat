@@ -374,7 +374,7 @@ def test_persona_is_friendly_by_default_and_proactive_in_erotic_mode():
 
     persona = (PLUGIN / "personas/personas.txt").read_text(encoding="utf-8")
     assert "默认对普通人是善意、友好" in persona
-    assert "只有对方有讨嫌或冒犯行为" in persona
+    assert "熟人玩笑可以轻松吐槽" in persona
     assert "不要只当被动应答器" in persona
     assert "人味不等于完整短评" in persona
     assert "自称统一使用“爱丽丝”" in persona
@@ -387,19 +387,19 @@ def test_persona_is_friendly_by_default_and_proactive_in_erotic_mode():
     assert "爱丽丝，好像明白了！" in persona
     assert "不能拿来装傻逃避擦边" in persona
     assert "对方在难受" in persona
-    assert "不立刻讨好" in persona
+    assert "认真纠正爱丽丝时可以坦然承认" in persona
 
     private_system = client._build_system_prompts(
         None, "", "default:FriendMessage:10001"
     )
     assert "普通正常互动默认善意" in private_system
     assert "主动带节奏" in private_system
-    assert "不立刻讨好" in private_system
+    assert "对方认真纠正时坦然承认" in private_system
 
     group_system = client._build_system_prompts(None, "", "default:GroupMessage:20002")
     assert "默认对普通群友友善" in group_system
-    assert "不把普通群友当靶子" in group_system
-    assert "直接冲你骂" in group_system
+    assert "熟人玩笑轻松接住" in group_system
+    assert "讨论 AI、设定或数据库时平静说明身份" in group_system
 
 
 def test_at_prompt_uses_proactive_flirty_state_not_previous_sarcasm():
@@ -422,7 +422,7 @@ def test_at_prompt_uses_proactive_flirty_state_not_previous_sarcasm():
     assert "闷骚色小鬼" in at_rule
     assert "明确邀请“涩涩”" in at_rule
     assert "第一轮就接住" in at_rule
-    assert "当前 mood 的讥讽" in at_rule
+    assert "上一轮心境只作背景" in at_rule
     assert "对方明确拒绝、喊停" in at_rule
 
     system_prompt = client._build_system_prompts(

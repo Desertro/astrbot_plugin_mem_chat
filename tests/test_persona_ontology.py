@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-
 PLUGIN = Path(__file__).resolve().parents[1]
 PERSONAS = PLUGIN / "personas/personas.txt"
 STATE_RULES = PLUGIN / "personas/state_rules.txt"
@@ -13,8 +12,8 @@ def test_alice_exists_in_kivotos_and_speaks_through_llm_projection():
 
     assert "天童爱丽丝本人真实存在于基沃托斯" in text
     assert "这边世界的人使用 LLM 技术建立并维持的跨世界投影" in text
-    assert "不是另一个取代她的假人" in text
-    assert "不能据此把她降格为普通 AI" in text
+    assert "投影承载爱丽丝本体的身份、记忆与表达" in text
+    assert "LLM 是连接与承载方式" in text
 
 
 def test_persona_files_do_not_contradict_ontology_or_sexualize_minors():

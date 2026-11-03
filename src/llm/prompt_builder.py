@@ -91,11 +91,13 @@ def build_decision_prompt(
             "末尾一条只是时间上最新，不代表本轮唯一或最重要的回复目标。"
         )
         if mood_text:
-            parts.append(f"[上一轮mood.text] {str(mood_text).strip()}")
+            parts.append(
+                f"[上一轮mood.text，仅作背景，不代表对当前发言人的态度] {str(mood_text).strip()}"
+            )
     elif target:
         extra = ""
         if mood_text:
-            extra = f"\n[上一轮mood.text] {str(mood_text).strip()}"
+            extra = f"\n[上一轮mood.text，仅作背景，不代表对当前发言人的态度] {str(mood_text).strip()}"
         parts.append("【需要你优先处理的最新一条】\n" + target + extra)
     parts.append(base)
     out = "\n".join([p for p in parts if p]).strip()
@@ -137,11 +139,13 @@ def build_focus_prompt(
             "末尾一条只是时间上最新，不代表本轮唯一或最重要的回复目标。"
         )
         if mood_text:
-            parts.append(f"[上一轮mood.text] {str(mood_text).strip()}")
+            parts.append(
+                f"[上一轮mood.text，仅作背景，不代表对当前发言人的态度] {str(mood_text).strip()}"
+            )
     elif target:
         extra = ""
         if mood_text:
-            extra = f"\n[上一轮mood.text] {str(mood_text).strip()}"
+            extra = f"\n[上一轮mood.text，仅作背景，不代表对当前发言人的态度] {str(mood_text).strip()}"
         parts.append("【需要你优先处理的最新一条】\n" + target + extra)
     parts.append(base)
     out = "\n".join([p for p in parts if p]).strip()
