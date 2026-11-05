@@ -21,7 +21,7 @@ class Event:
     def __init__(self, mid="a", text="hello"):
         self.message_obj = SimpleNamespace(message_id=mid, message=[Plain(text)])
         self.message_str = text
-        self._mem_chat_wake_reason = "name_call"
+        self._mem_chat_wake_reason = "platform_at"
 
     def get_group_id(self):
         return "42"
@@ -33,6 +33,7 @@ class Event:
 @pytest.fixture
 def scheduler(monkeypatch):
     config = {
+        "activity_scheduling_enabled": False,
         "heartbeat_cycle": 300,
         "decision_msg_count_min": 5,
         "focus_mode_cycle": 30,
@@ -120,22 +121,24 @@ def test_extension_limits_and_legacy_control():
 
 
 @pytest.mark.parametrize(
-    "large, expected", [(False, [20, 40, 60, 300]), (True, [36, 72, 108, 540])]
+    "large, expected, thresholds",
+    [(False, [20, 160, 300], [1, 3, 5]), (True, [36, 288, 540], [1, 5, 10])],
 )
-def test_linear_cooling_and_cold_start(scheduler, large, expected):
+def test_elapsed_linear_cooling_and_cold_start(
+    scheduler, monkeypatch, large, expected, thresholds
+):
     if large:
         scheduler.state.set_group_member_count("42", 150)
     assert scheduler._read_air_wait_seconds(UMO) == expected[-1]
+    clock = [1000.0]
+    monkeypatch.setattr("src.core.scheduler.time.monotonic", lambda: clock[0])
     scheduler._enter_read_air(UMO)
-    actual = []
-    for _ in range(3):
-        actual.append(scheduler._read_air_wait_seconds(UMO))
-        assert scheduler._read_air_min_messages(UMO) == 1
-        scheduler._advance_read_air(UMO)
-    scheduler._read_air_rounds[UMO] = 100
-    actual.append(scheduler._read_air_wait_seconds(UMO))
-    assert actual == expected
-    assert scheduler._read_air_min_messages(UMO) == (10 if large else 5)
+    for elapsed, wait, minimum in zip([0, 150, 300], expected, thresholds):
+        clock[0] = 1000.0 + elapsed
+        assert scheduler._read_air_wait_seconds(UMO) == wait
+        assert scheduler._read_air_min_messages(UMO) == minimum
+    clock[0] += 3600
+    assert scheduler._read_air_wait_seconds(UMO) == expected[-1]
 
 
 @pytest.mark.asyncio
@@ -147,7 +150,7 @@ async def test_no_reply_can_extend_without_marking_a_send(scheduler):
     )
     assert 129 <= scheduler.state.get_focus_remaining_sec(UMO) <= 131
     assert UMO not in scheduler._last_send_ts
-    assert UMO not in scheduler._read_air_rounds
+    assert UMO not in scheduler._read_air_started_at
 
 
 @pytest.mark.asyncio
@@ -165,7 +168,7 @@ async def test_release_wins_over_auto_focus_and_stale_result(scheduler):
     task = turn(scheduler, action="release")
     scheduler._finish_group_turn(task, replied=True, sent=True)
     assert not scheduler.state.is_in_focus(UMO)
-    assert scheduler._read_air_wait_seconds(UMO) == 20
+    assert scheduler._read_air_wait_seconds(UMO) == pytest.approx(20, abs=0.01)
     task = turn(scheduler, action="release")
     scheduler.note_attention_call(UMO, Event())
     scheduler._finish_group_turn(task, replied=True, sent=True)
@@ -223,15 +226,15 @@ async def test_cold_below_threshold_keeps_messages_and_rearms(scheduler):
 
 
 @pytest.mark.asyncio
-async def test_empty_cooling_advances_without_model_then_stops(scheduler):
+async def test_empty_cooling_uses_elapsed_time_without_model_then_stops(scheduler):
     scheduler._enter_read_air(UMO)
     scheduler._cycle_events[UMO] = Event()
     scheduler.trigger_view_cycle = AsyncMock()
     scheduler.add_task = AsyncMock()
     await scheduler._cycle_wait_and_submit(UMO, "read_air", 0, Event(), [])
-    assert scheduler._read_air_wait_seconds(UMO) == 40
+    assert scheduler._read_air_wait_seconds(UMO) == pytest.approx(20, abs=0.01)
     scheduler.add_task.assert_not_awaited()
-    scheduler._read_air_rounds[UMO] = 100
+    scheduler._read_air_started_at[UMO] -= 300
     await scheduler._rearm_group_cycle(UMO)
     scheduler.trigger_view_cycle.assert_not_awaited()
 
@@ -294,7 +297,7 @@ async def test_focus_expiry_runs_independently_of_busy_queue(scheduler, monkeypa
     scheduler.active_queues.add(UMO)
     scheduler.trigger_view_cycle = AsyncMock()
     await Scheduler._wait_focus_expiry(scheduler, UMO, deadline, event)
-    assert scheduler._read_air_rounds[UMO] == 0
+    assert UMO in scheduler._read_air_started_at
     scheduler.trigger_view_cycle.assert_awaited_once_with(UMO, "read_air", event, [])
 
 
@@ -333,3 +336,94 @@ def test_private_pending_keeps_existing_fifty_row_limit():
         state.update_last_message(scope, mid, "hello", "user", "1")
     assert len(state.get_pending_messages(scope)) == 50
     assert state.get_pending_messages(scope)[0][0] == "20"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["read_air", "focus"])
+async def test_ambient_send_does_not_reopen_focus_or_reset_cooling(scheduler, lane):
+    scheduler._enter_read_air(UMO)
+    scheduler._read_air_started_at[UMO] -= 150
+    started = scheduler._read_air_started_at[UMO]
+    scheduler._finish_group_turn(turn(scheduler, lane=lane), replied=True, sent=True)
+    assert not scheduler.state.is_in_focus(UMO)
+    assert scheduler._read_air_started_at[UMO] == started
+    assert scheduler._read_air_wait_seconds(UMO) == pytest.approx(160, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_release_while_already_cooling_does_not_restart_short_wait(scheduler):
+    scheduler._enter_read_air(UMO)
+    scheduler._read_air_started_at[UMO] -= 150
+    started = scheduler._read_air_started_at[UMO]
+    scheduler._finish_group_turn(
+        turn(scheduler, lane="read_air", action="release"), replied=True, sent=True
+    )
+    assert scheduler._read_air_started_at[UMO] == started
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_focused", [False, True])
+async def test_name_candidate_does_not_refresh_attention_on_arrival(
+    scheduler, already_focused
+):
+    if already_focused:
+        scheduler.state.set_focus(UMO, 40)
+    else:
+        scheduler._enter_read_air(UMO)
+    deadline = scheduler.state.focus_until.get(UMO)
+    started = scheduler._read_air_started_at.get(UMO)
+    event = Event(text="爱丽丝是对的")
+    event._mem_chat_wake_reason = "name_call"
+    scheduler.note_attention_call(UMO, event)
+    assert scheduler.state.focus_until.get(UMO) == deadline
+    assert scheduler._read_air_started_at.get(UMO) == started
+    scheduler.trigger_view_cycle = AsyncMock()
+    add_pending(scheduler, "name-candidate", directed=True)
+    scheduler._cycle_events[UMO] = event
+    await scheduler._rearm_group_cycle(UMO)
+    assert scheduler.trigger_view_cycle.await_args.args[1] == "at"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("addressed", [False, None, "true", 1, True])
+async def test_name_call_requires_model_confirmation_before_default_focus(
+    scheduler, addressed
+):
+    scheduler._enter_read_air(UMO)
+    started = scheduler._read_air_started_at[UMO]
+    task = turn(scheduler, lane="at")
+    task.extra_args["attention_origin"] = "name_call"
+    task.event._mem_chat_last_structured_payload["control"]["addressed"] = addressed
+    scheduler._finish_group_turn(task, replied=True, sent=True)
+    assert scheduler.state.is_in_focus(UMO) is (addressed is True)
+    if addressed is not True:
+        assert scheduler._read_air_started_at[UMO] == started
+
+
+@pytest.mark.asyncio
+async def test_name_call_intentional_silence_does_not_start_focus_or_retry(scheduler):
+    task = turn(scheduler, lane="at")
+    task.extra_args["attention_origin"] = "name_call"
+    task.event._mem_chat_last_structured_payload["control"]["addressed"] = True
+    scheduler._finish_group_turn(task, replied=True, sent=False)
+    assert not scheduler.state.is_in_focus(UMO)
+    assert UMO not in scheduler._retry_windows
+
+
+@pytest.mark.asyncio
+async def test_ambient_reply_can_explicitly_extend_focus(scheduler):
+    scheduler._enter_read_air(UMO)
+    scheduler._finish_group_turn(
+        turn(scheduler, lane="read_air", action="extend"), replied=True, sent=True
+    )
+    assert 89 <= scheduler.state.get_focus_remaining_sec(UMO) <= 91
+
+
+def test_large_override_reaches_steady_wait_and_threshold_in_five_minutes(scheduler):
+    scheduler.config["group_frequency_overrides"] = {
+        "42": {"cycle_multiplier": 3.2, "min_message_bonus": 10}
+    }
+    scheduler._enter_read_air(UMO)
+    scheduler._read_air_started_at[UMO] -= 300
+    assert scheduler._read_air_wait_seconds(UMO) == 960
+    assert scheduler._read_air_min_messages(UMO) == 15

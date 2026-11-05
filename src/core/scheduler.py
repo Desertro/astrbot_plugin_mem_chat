@@ -15,8 +15,9 @@ from ..db.database import DatabaseManager
 from ..llm.prompt_builder import build_decision_prompt, build_focus_prompt
 from ..llm_client import LLMClient
 from .attention import normalize_focus_control
+from .group_activity import GroupActivity
 from .member_tags import format_sender, load_sender_tags
-from .models import ReplyTask
+from .models import DummyEvent, ReplyTask
 from .state import MemChatState
 
 logger = logging.getLogger("astrbot")
@@ -48,13 +49,17 @@ class Scheduler:
         self.active_queues = set()
         self.cycle_timers = {}  # umo -> asyncio.TimerHandle (or Task)
         self._last_send_ts = {}
+        self.group_activity = GroupActivity()
+        self._bubble_timers = {}
+        self._bubble_due = {}
+        self._bubble_seen = {}
         self._queued_group_at: set[str] = set()
         self._deferred_focus = {}  # umo -> bool
         self._deferred_cycles = {}
         self._cycle_events = {}
         self._focus_expiry = {}
         self._attention_versions = defaultdict(int)
-        self._read_air_rounds = {}
+        self._read_air_started_at = {}
         self._retry_windows = {}
         self._closed = False
         self._queue_workers = {}
@@ -68,11 +73,181 @@ class Scheduler:
             *self.cycle_timers.values(),
             *self._focus_expiry.values(),
             *self._queue_workers.values(),
+            *self._bubble_timers.values(),
         ]:
             timer.cancel()
         self.cycle_timers.clear()
         self._focus_expiry.clear()
         self._deferred_cycles.clear()
+        self._bubble_timers.clear()
+
+    def _activity_enabled(self, umo):
+        """Return whether a group uses traffic-based scheduling.
+
+        Args:
+            umo: Conversation scope.
+
+        Returns:
+            Whether member-count timing is replaced for this group.
+        """
+        return bool(
+            self._group_id_from_umo(umo)
+            and self._get_conf("activity_scheduling_enabled", True)
+        )
+
+    def note_group_activity(self, umo, event):
+        """Observe a deduplicated non-command arrival and arm one optional bubble.
+
+        Args:
+            umo: Group conversation scope.
+            event: Human incoming event after the plugin's self-message filter.
+        """
+        if self._closed or not self._activity_enabled(umo):
+            return
+        self.group_activity.record(umo, str(event.get_sender_id() or ""))
+        self._cycle_events[umo] = event
+        if not (
+            self._get_conf("read_air_enable", True)
+            and self._get_conf("group_bubble_enabled", True)
+        ):
+            return
+        timer = self._bubble_timers.get(umo)
+        if timer and not timer.done():
+            return
+        self._bubble_timers[umo] = asyncio.create_task(self._wait_group_bubble(umo))
+
+    def _group_bubble_ready(self, umo, revision):
+        """Check freshness, silence and direct-message priority before a bubble.
+
+        Args:
+            umo: Group conversation scope.
+            revision: Human-arrival revision frozen for the optional turn.
+
+        Returns:
+            Whether this background opportunity is still relevant.
+        """
+        metrics = self.group_activity.snapshot(umo)
+        silence = time.time() - self._last_send_ts.get(umo, 0)
+        minimum = max(
+            2700.0,
+            self._to_float(self._get_conf("group_bubble_interval_min_sec", 2700), 2700),
+        )
+        return bool(
+            not self._closed
+            and self._activity_enabled(umo)
+            and self._get_conf("read_air_enable", True)
+            and self._get_conf("group_bubble_enabled", True)
+            and metrics["revision"] == revision
+            and 90 <= metrics["age"] <= 1200
+            and silence >= minimum
+            and not self.state.is_in_focus(umo)
+            and not self.state.get_pending_count(umo)
+            and umo not in self._queued_group_at
+        )
+
+    async def _wait_group_bubble(self, umo):
+        """Offer at most one low-frequency turn for fresh, already-read context.
+
+        Args:
+            umo: Group conversation scope.
+        """
+        low = max(
+            2700.0,
+            self._to_float(self._get_conf("group_bubble_interval_min_sec", 2700), 2700),
+        )
+        high = max(
+            low,
+            self._to_float(self._get_conf("group_bubble_interval_max_sec", 5400), 5400),
+        )
+        interval = self.random.uniform(low, high)
+        due = self._bubble_due.setdefault(umo, time.time() + interval)
+        try:
+            while not self._closed:
+                due = max(due, self._last_send_ts.get(umo, 0) + interval)
+                await asyncio.sleep(max(1.0, due - time.time()))
+                metrics = self.group_activity.snapshot(umo)
+                revision = metrics["revision"]
+                if metrics["age"] > 1200 or revision == self._bubble_seen.get(umo):
+                    return
+                if (
+                    not self._group_bubble_ready(umo, revision)
+                    or umo in self.active_queues
+                    or not self.task_queues[umo].empty()
+                ):
+                    due = time.time() + 120
+                    continue
+                self._bubble_seen[umo] = revision
+                self._bubble_due[umo] = time.time() + self.random.uniform(low, high)
+                event = DummyEvent(umo, self.context)
+                event._mem_chat_group_bubble_revision = revision
+                task = ReplyTask(
+                    umo,
+                    20,
+                    "read_air",
+                    event=event,
+                    extra_args={"group_bubble": True, "revision": revision},
+                )
+                logger.info(
+                    "[mem_chat] Group bubble opportunity scope=%s revision=%s",
+                    umo,
+                    revision,
+                )
+                await self.add_task(task)
+                return
+        finally:
+            if self._bubble_timers.get(umo) is asyncio.current_task():
+                self._bubble_timers.pop(umo, None)
+
+    async def _run_group_bubble(self, task):
+        """Let the dialogue model optionally speak without re-consuming old input.
+
+        Args:
+            task: Serialized low-priority task containing the frozen arrival revision.
+        """
+        umo = task.umo
+        revision = task.extra_args["revision"]
+        if not self._group_bubble_ready(umo, revision):
+            return
+        history = await self.get_recent_history(
+            umo, 12, task.event, task_type="read_air"
+        )
+        if not history or not self._group_bubble_ready(umo, revision):
+            return
+        prompt = (
+            "【偶尔冒泡的机会】\n"
+            "下面是已经读过的近期群聊背景，没有新问题，也没有人要求你回答旧消息。"
+            "爱丽丝已经安静了一段时间，可以根据自己的兴趣、心情自然说一句近况、"
+            "轻轻接一下还相关的话题，或用一个合适的表情表达心情。"
+            "这只是机会，没有想说的就输出 control.decision=no_reply。"
+            "不要为了完成任务硬找话题，不翻旧账，不补答已经结束的问答，不叫人来陪聊。"
+            "如果开口，一条简短的消息或一个表情就可以，不调用工具。\n"
+            "【已读背景，仅供参考】\n" + "\n".join(history[-12:])
+        )
+        self.state.set_processing(umo, True)
+        try:
+            replied = await self._await_task_stage(
+                task,
+                "invoke_llm",
+                self.llm_client.invoke_llm(
+                    umo,
+                    prompt,
+                    "",
+                    event=task.event,
+                    task_type="read_air",
+                    user_msgs_to_save=[],
+                    image_urls=[],
+                    quote_candidates=[],
+                    at_candidates=[],
+                    impression_mode="off",
+                    created_at=task.created_at,
+                ),
+            )
+        finally:
+            self.state.set_processing(umo, False)
+        sent = bool(replied and getattr(task.event, "_mem_chat_last_send_ok", False))
+        if sent:
+            self._last_send_ts[umo] = time.time()
+        logger.info("[mem_chat] Group bubble result scope=%s sent=%s", umo, sent)
 
     def _set_group_focus(self, umo, duration, event):
         """Set a bounded focus window with room for one scheduled check.
@@ -87,7 +262,7 @@ class Scheduler:
         maximum = self._focus_duration_bounds()[1]
         duration = min(maximum, max(float(duration), min(delay + 15, maximum)))
         self.state.set_focus(umo, math.ceil(duration))
-        self._read_air_rounds.pop(umo, None)
+        self._read_air_started_at.pop(umo, None)
         previous = self._focus_expiry.pop(umo, None)
         if previous and previous is not asyncio.current_task():
             previous.cancel()
@@ -125,7 +300,7 @@ class Scheduler:
         """
         self.state.focus_until.pop(umo, None)
         self.state.is_in_focus(umo)
-        self._read_air_rounds[umo] = 0
+        self._read_air_started_at.setdefault(umo, time.monotonic())
         self.state.reset_focus_delay(umo, self._focus_cycle_bounds(umo)[3])
         expiry = self._focus_expiry.pop(umo, None)
         if expiry and expiry is not asyncio.current_task():
@@ -146,6 +321,16 @@ class Scheduler:
         """
         self._attention_versions[umo] += 1
         self._retry_windows.pop(umo, None)
+        origin = getattr(event, "_mem_chat_wake_reason", "platform_at")
+        if origin == "name_call":
+            self._cycle_events[umo] = event
+            logger.info(
+                "[mem_chat] Attention candidate scope=%s origin=%s version=%s",
+                umo,
+                origin,
+                self._attention_versions[umo],
+            )
+            return
         low, high, step, base = self._focus_cycle_bounds(umo)
         current = self.state.get_focus_delay(umo, base)
         reduction = self._to_float(self._get_conf("focus_mode_cycle_at_reduce", 20), 20)
@@ -184,6 +369,8 @@ class Scheduler:
             self._retry_windows[umo] = (key, count + 1 if key == previous else 1)
             return
         self._retry_windows.pop(umo, None)
+        if self._activity_enabled(umo):
+            self.group_activity.finish(umo, sent=sent, directed=task.task_type == "at")
         payload = getattr(task.event, "_mem_chat_last_structured_payload", None) or {}
         control = normalize_focus_control(
             payload.get("control"), self._focus_duration_bounds()[2]
@@ -193,11 +380,19 @@ class Scheduler:
             self._enter_read_air(umo)
         else:
             remaining = self.state.get_focus_remaining_sec(umo)
-            entering = bool(sent and not self.state.is_in_focus(umo))
-            if task.task_type == "at":
+            origin = task.extra_args.get(
+                "attention_origin",
+                getattr(task.event, "_mem_chat_wake_reason", "platform_at"),
+            )
+            addressed = isinstance(payload.get("control"), dict) and (
+                payload["control"].get("addressed") is True
+            )
+            directed_turn = task.task_type == "at" and (
+                origin == "platform_at"
+                or (origin == "name_call" and addressed and sent)
+            )
+            if directed_turn:
                 remaining = max(remaining, self._focus_duration_bounds()[3])
-            elif sent and not self.state.is_in_focus(umo):
-                remaining = self._focus_duration_bounds()[3]
             if action == "extend":
                 remaining += control["seconds"]
             if sent and task.task_type == "focus":
@@ -206,12 +401,8 @@ class Scheduler:
                     self.state.get_focus_delay(umo, base), high, step, low, high
                 )
                 self.state.set_focus_delay(umo, delay, min_val=low)
-            if remaining > 0 and (
-                action == "extend" or task.task_type == "at" or entering
-            ):
+            if remaining > 0 and (action == "extend" or directed_turn):
                 self._set_group_focus(umo, remaining, task.event)
-            if task.task_type == "read_air" and not self.state.is_in_focus(umo):
-                self._advance_read_air(umo)
         logger.info(
             "[mem_chat] Attention result scope=%s decision=%s action=%s remaining=%.1f reason=%s",
             umo,
@@ -220,15 +411,6 @@ class Scheduler:
             self.state.get_focus_remaining_sec(umo),
             control.get("reason", ""),
         )
-
-    def _advance_read_air(self, umo):
-        """Advance one bounded linear cooling step.
-
-        Args:
-            umo: Group conversation scope.
-        """
-        if umo in self._read_air_rounds:
-            self._read_air_rounds[umo] = min(10000, self._read_air_rounds[umo] + 1)
 
     async def _rearm_group_cycle(self, umo):
         """Resume one group timer after the queue drains.
@@ -253,7 +435,10 @@ class Scheduler:
         elif self.state.is_in_focus(umo):
             if rows or failures:
                 await self.trigger_view_cycle(umo, "focus", event, [])
-        elif rows or self._read_air_wait_seconds(umo) < self._steady_read_air_wait(umo):
+        elif rows or (
+            not self._activity_enabled(umo)
+            and self._read_air_wait_seconds(umo) < self._steady_read_air_wait(umo)
+        ):
             await self.trigger_view_cycle(umo, "read_air", event, [])
 
     def _steady_read_air_wait(self, umo):
@@ -265,6 +450,8 @@ class Scheduler:
         Returns:
             Interval including the group-size multiplier.
         """
+        if self._activity_enabled(umo):
+            return self.group_activity.interval(umo) * self._large_group_multiplier(umo)
         return max(
             5.0, self._to_float(self._get_conf("heartbeat_cycle", 60), 60)
         ) * self._large_group_multiplier(umo)
@@ -275,7 +462,10 @@ class Scheduler:
         Args:
             umo: Group conversation scope.
         """
-        ttl = max(180, 2 * self._steady_read_air_wait(umo) + 60)
+        ttl = max(
+            600 if self._activity_enabled(umo) else 180,
+            2 * self._steady_read_air_wait(umo) + 60,
+        )
         cutoff = time.time() - ttl
         expired = [
             row for row in self.state.get_pending_messages(umo) if row[4] < cutoff
@@ -472,7 +662,6 @@ class Scheduler:
                 )
                 if count < minimum or (not group_batch and count > maximum):
                     if group_batch:
-                        self._advance_read_air(umo)
                         restarted = False
                     else:
                         self.state.reset_read_air_msg_count(umo)
@@ -483,7 +672,7 @@ class Scheduler:
                     return
             elif task_type == "focus" and not self.state.is_in_focus(umo):
                 if group_batch:
-                    if umo not in self._read_air_rounds:
+                    if umo not in self._read_air_started_at:
                         self._enter_read_air(umo)
                 else:
                     self.state.set_cycle_task_type(umo, None)
@@ -650,8 +839,31 @@ class Scheduler:
         return self.state.get_group_member_count(gid) if gid else 0
 
     def _large_group_multiplier(self, umo: str) -> float:
+        if self._activity_enabled(umo):
+            overrides = self._get_conf("group_frequency_overrides", {})
+            group = (
+                overrides.get(self._group_id_from_umo(umo), {})
+                if isinstance(overrides, dict)
+                else {}
+            )
+            value = (
+                group.get("activity_cycle_multiplier", 1.0)
+                if isinstance(group, dict)
+                else 1.0
+            )
+            return self._clamp_float(self._to_float(value, 1.0), 1.0, 5.0)
         if not bool(self._get_conf("large_group_frequency_enabled", True)):
             return 1.0
+        overrides = self._get_conf("group_frequency_overrides", {})
+        group_id = self._group_id_from_umo(umo)
+        group = (
+            overrides.get(group_id, {})
+            if group_id and isinstance(overrides, dict)
+            else {}
+        )
+        if isinstance(group, dict) and "cycle_multiplier" in group:
+            multiplier = self._to_float(group["cycle_multiplier"], 1.8)
+            return self._clamp_float(multiplier, 1.0, 5.0)
         count = self._group_member_count_for_umo(umo)
         threshold = max(
             1,
@@ -670,22 +882,28 @@ class Scheduler:
 
     def _read_air_wait_seconds(self, umo: str) -> float:
         maximum = self._steady_read_air_wait(umo)
-        if umo not in self._read_air_rounds:
+        started_at = self._read_air_started_at.get(umo)
+        if started_at is None:
             return maximum
-        start = max(
-            1.0, self._to_float(self._get_conf("read_air_transition_start_sec", 20), 20)
-        )
-        step = max(
-            1.0, self._to_float(self._get_conf("read_air_transition_step_sec", 20), 20)
-        )
-        return min(
+        start = min(
             maximum,
-            (start + self._read_air_rounds[umo] * step)
+            max(
+                1.0,
+                self._to_float(self._get_conf("read_air_transition_start_sec", 20), 20),
+            )
             * self._large_group_multiplier(umo),
         )
+        duration = max(
+            1.0,
+            self._to_float(
+                self._get_conf("read_air_transition_duration_sec", 300), 300
+            ),
+        )
+        progress = min(1.0, max(0.0, time.monotonic() - started_at) / duration)
+        return start + (maximum - start) * progress
 
     def _read_air_min_messages(self, umo: str) -> int:
-        if self._read_air_wait_seconds(umo) < self._steady_read_air_wait(umo):
+        if self._activity_enabled(umo):
             return 1
         try:
             base = int(self._get_conf("decision_msg_count_min", 1) or 1)
@@ -701,12 +919,58 @@ class Scheduler:
                     )
                 ),
             )
-        return max(1, base + bonus)
+            overrides = self._get_conf("group_frequency_overrides", {})
+            group_id = self._group_id_from_umo(umo)
+            group = (
+                overrides.get(group_id, {})
+                if group_id and isinstance(overrides, dict)
+                else {}
+            )
+            if isinstance(group, dict) and "min_message_bonus" in group:
+                bonus = max(0, int(self._to_float(group["min_message_bonus"], bonus)))
+        maximum = max(1, base + bonus)
+        started_at = self._read_air_started_at.get(umo)
+        if started_at is None:
+            return maximum
+        duration = max(
+            1.0,
+            self._to_float(
+                self._get_conf("read_air_transition_duration_sec", 300), 300
+            ),
+        )
+        progress = min(1.0, max(0.0, time.monotonic() - started_at) / duration)
+        return 1 + int((maximum - 1) * progress)
 
     def _cap_focus_duration(self, umo: str, duration: int) -> int:
         return max(1, min(int(duration), self._focus_duration_bounds()[1]))
 
     def _large_group_decision_note(self, umo: str) -> str:
+        if self._activity_enabled(umo):
+            metrics = self.group_activity.snapshot(umo)
+            previous = self._last_send_ts.get(umo)
+            own_note = (
+                f"爱丽丝距上次发言约{max(0, time.time() - previous) / 60:.1f}分钟。"
+                if previous
+                else "本次运行中爱丽丝尚未在这里发言。"
+            )
+            if self._large_group_multiplier(umo) > 1.0:
+                own_note += (
+                    "本群希望适度少插话：有人与你交流时自然回应，"
+                    "群友彼此聊天时可以旁观。focus只表示正在关注，不代表每轮都要说话；"
+                    "根据群友实际接你的话延长focus，话题已经转开就release。"
+                )
+            return (
+                "【当前群聊节奏】"
+                f"近2分钟约{metrics['short_rate']:.1f}段发言/分钟，"
+                f"近10分钟约{metrics['long_rate']:.1f}段/分钟，"
+                f"近2分钟{metrics['speakers']}位群友参与；连续拆句已合并统计。"
+                + own_note
+                + "这些只是背景，不代表必须开口或必须旁观。可以自然接梗、关心进度、"
+                "表达情绪或发表情，不需要每句话都提供新知识。群友正在与你交流时自然接着聊；"
+                "多人热聊时选择想接的内容，已经表达过的观点不用连续重复。"
+                "群友转向彼此交谈时可以继续旁观，并用control.focus的release动作结束关注；"
+                "有人继续和你聊时也可以用control.focus的extend动作自然延长关注。"
+            )
         if self._large_group_multiplier(umo) <= 1.0:
             return ""
         return (
@@ -746,7 +1010,9 @@ class Scheduler:
             multiplier = self._large_group_multiplier(umo)
             if multiplier > 1.0:
                 return (
-                    min_v * multiplier,
+                    max(min_v, base) * multiplier
+                    if self._activity_enabled(umo)
+                    else min_v * multiplier,
                     max_v * multiplier,
                     step_max * multiplier,
                     base * multiplier,
@@ -1419,7 +1685,8 @@ class Scheduler:
                     self._queued_group_at.discard(umo)
                 group_batch = bool(task.event and task.event.get_group_id())
                 if group_batch:
-                    self._cycle_events[umo] = task.event
+                    if not task.extra_args.get("group_bubble"):
+                        self._cycle_events[umo] = task.event
                     task.extra_args["attention_version"] = self._attention_versions[umo]
                 try:
                     # Check timeout
@@ -1461,6 +1728,11 @@ class Scheduler:
                                     )
                                     continue
 
+                    if task.extra_args.get("group_bubble"):
+                        task.extra_args["attention_finished"] = True
+                        await self._run_group_bubble(task)
+                        continue
+
                     # Freeze the cycle before any awaited context or model work.
                     if group_batch:
                         self._prune_group_pending(umo)
@@ -1472,6 +1744,25 @@ class Scheduler:
                         if row[4] <= cycle_cutoff_ts
                         and not self.state.is_no_reply_message_id(umo, row[0])
                     ]
+                    if group_batch:
+                        origins = {
+                            self.state.get_message_meta(umo, row[0]).get(
+                                "wake_reason", "platform_at"
+                            )
+                            for row in pending_snapshot
+                            if self.state.get_message_meta(umo, row[0]).get(
+                                "is_directed"
+                            )
+                        }
+                        origin = (
+                            "platform_at"
+                            if "platform_at" in origins
+                            else "name_call"
+                            if "name_call" in origins
+                            else "ordinary"
+                        )
+                        task.extra_args["attention_origin"] = origin
+                        task.event._mem_chat_attention_origin = origin
                     # Re-fetch context at execution time
                     history_count = int(self._get_conf("history_message_count", 12))
                     history_msgs = await self.get_recent_history(
@@ -1855,7 +2146,11 @@ class Scheduler:
                             # the exact moment its task starts.
                             try:
                                 heartbeat = float(self._get_conf("heartbeat_cycle", 60))
-                                stale_default = max(180.0, heartbeat + 60.0)
+                                stale_default = max(
+                                    180.0,
+                                    heartbeat + 60.0,
+                                    self._steady_read_air_wait(umo) + 60.0,
+                                )
                             except Exception:
                                 pass
                         stale_sec = float(
@@ -2138,6 +2433,22 @@ class Scheduler:
                                     "focus_non_at_use_decision_prompt", False
                                 )
                             )
+                            if group_batch:
+                                overrides = self._get_conf(
+                                    "group_frequency_overrides", {}
+                                )
+                                group = (
+                                    overrides.get(self._group_id_from_umo(umo), {})
+                                    if isinstance(overrides, dict)
+                                    else {}
+                                )
+                                if isinstance(group, dict):
+                                    use_decision = bool(
+                                        group.get(
+                                            "focus_non_at_use_decision_prompt",
+                                            use_decision,
+                                        )
+                                    )
                             self_id = self.state.get_self_id(umo)
                             if use_decision and self_id:
                                 has_at = False
@@ -2189,6 +2500,14 @@ class Scheduler:
                                 batch_mode=group_batch,
                             )
 
+                        if (
+                            group_batch
+                            and task.task_type == "focus"
+                            and self._activity_enabled(umo)
+                        ):
+                            prompt = (
+                                self._large_group_decision_note(umo) + "\n" + prompt
+                            )
                         prompt = self._strip_old_decision_blocks(prompt)
 
                         self_id = self.state.get_self_id(umo)

@@ -7,7 +7,7 @@ import time
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.message.components import (
     At,
@@ -47,6 +47,7 @@ try:
         parse_image_refs,
     )
     from .src.core.models import DummyEvent
+    from .src.core.plugin_activity import PluginActivityStore
     from .src.core.scheduler import Scheduler
     from .src.core.state import MemChatState
     from .src.db.database import DatabaseManager
@@ -68,6 +69,7 @@ except ImportError:
         parse_image_refs,
     )
     from src.core.models import DummyEvent
+    from src.core.plugin_activity import PluginActivityStore
     from src.core.scheduler import Scheduler
     from src.core.state import MemChatState
     from src.db.database import DatabaseManager
@@ -100,6 +102,9 @@ class MemChat(Star):
         self.config = config or {}
 
         self.state = MemChatState()
+        self.plugin_activities = PluginActivityStore(
+            StarTools.get_data_dir("mem_chat") / "plugin_activity"
+        )
         self.codex_service = CodexService(self.config)
 
         self._mem_db_path = os.path.join(
@@ -116,10 +121,227 @@ class MemChat(Star):
             self, self.config, self.db_mgr, self.llm_client, self.scheduler
         )
         self._register_codex_tool()
+        self._register_meme_library_tool()
 
         asyncio.create_task(self._startup_init())
 
         logger.info(f"[mem_chat] Plugin initialized. DB path: {self._mem_db_path}")
+
+    def _retain_image_bytes(self, raw_images, *, limit: int = 12) -> list[str]:
+        """Persist local copies of plugin input or output images.
+
+        Args:
+            raw_images: Raw image byte strings reported by a companion plugin.
+            limit: Maximum number of distinct files to retain.
+
+        Returns:
+            Stable local asset paths suitable for later model context.
+        """
+        import hashlib
+        import io
+
+        from PIL import Image as PILImage
+
+        images = []
+        for raw in raw_images or []:
+            if len(images) >= limit:
+                break
+            if not isinstance(raw, (bytes, bytearray)) or not raw:
+                continue
+            try:
+                data = bytes(raw)
+                if len(data) > 12 * 1024 * 1024:
+                    continue
+                with PILImage.open(io.BytesIO(data)) as img:
+                    extension = "." + str(img.format or "png").lower()
+                target = self.plugin_activities.assets / (
+                    hashlib.sha256(data).hexdigest() + extension
+                )
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.exists():
+                    target.write_bytes(data)
+                images.append(str(target))
+            except Exception as exc:
+                logger.warning(
+                    "[mem_chat] Plugin reference image retention failed: %s",
+                    type(exc).__name__,
+                )
+        return images
+
+    async def _retain_chain_images(self, chain, *, limit: int = 12):
+        """Persist delivered image components and count all output frames.
+
+        Args:
+            chain: Message components delivered by the companion plugin.
+            limit: Maximum number of distinct output image files to retain.
+
+        Returns:
+            Retained paths, total image frame count and other media type names.
+        """
+        import asyncio
+        from pathlib import Path
+
+        images = []
+        image_outputs = 0
+        media_types = []
+        pending = list(getattr(chain, "chain", chain) or [])
+        while pending:
+            part = pending.pop(0)
+            if isinstance(part, Nodes):
+                pending.extend(part.nodes)
+            elif isinstance(part, Node):
+                pending.extend(part.content or [])
+            elif isinstance(part, Image):
+                image_outputs += 1
+                if len(images) >= limit:
+                    continue
+                try:
+                    source = Path(
+                        await asyncio.wait_for(part.convert_to_file_path(), timeout=5)
+                    )
+                    if source.stat().st_size > 12 * 1024 * 1024:
+                        continue
+                    images.extend(
+                        self._retain_image_bytes(
+                            [source.read_bytes()], limit=limit - len(images)
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[mem_chat] Plugin output image retention failed: %s",
+                        type(exc).__name__,
+                    )
+            elif getattr(part, "type", None):
+                media_types.append(str(part.type))
+        return list(dict.fromkeys(images)), image_outputs, media_types
+
+    async def record_plugin_activity(
+        self,
+        event,
+        *,
+        plugin: str,
+        status: str,
+        summary: str,
+        chain=None,
+        source_url: str = "",
+        reference_images=None,
+    ):
+        """Record companion plugin output without waking or impersonating Alice.
+
+        Args:
+            event: User event that triggered the companion plugin.
+            plugin: Trusted integration identifier.
+            status: Actual execution or delivery outcome.
+            summary: Short result summary without credentials or backend details.
+            chain: Successfully delivered components, if any.
+            source_url: Original public link, when applicable.
+            reference_images: Raw images submitted to the plugin for this request.
+        """
+        if plugin not in {"parser", "shoubanhua"}:
+            return
+        scope = str(getattr(event, "unified_msg_origin", "") or "")
+        if not scope:
+            return
+        config = getattr(self, "config", {})
+        group_id = str(event.get_group_id() or "")
+        if group_id:
+            allowed_groups = {
+                str(item) for item in config.get("group_whitelist", []) or []
+            }
+            if allowed_groups and group_id not in allowed_groups:
+                return
+        elif str(event.get_sender_id() or "") not in {
+            str(item) for item in config.get("private_chat_uids", []) or []
+        }:
+            return
+        images, image_outputs, media_types = await self._retain_chain_images(chain)
+        input_images = self._retain_image_bytes(reference_images, limit=4)
+        payload = {
+            "plugin": plugin,
+            "status": status,
+            "summary": str(summary)[:700],
+            "source_message_id": str(
+                getattr(getattr(event, "message_obj", None), "message_id", "") or ""
+            ),
+            "trigger_user_id": str(event.get_sender_id() or ""),
+            "trigger_user_name": str(event.get_sender_name() or ""),
+            "request": str(getattr(event, "message_str", "") or "")[:500],
+            "source_url": str(source_url)[:500],
+            "images": list(dict.fromkeys(images)),
+            "input_images": input_images,
+            "other_media": list(dict.fromkeys(media_types)),
+            "image_outputs": image_outputs,
+            "input_image_count": len(input_images),
+        }
+        if self.plugin_activities.record(scope, payload):
+            logger.info(
+                "[mem_chat] Plugin activity recorded scope=%s plugin=%s "
+                "status=%s images=%s input_images=%s",
+                scope,
+                plugin,
+                status,
+                len(images),
+                len(input_images),
+            )
+
+    def _register_meme_library_tool(self):
+        """Register exact sticker lookup and deletion as a native LLM tool."""
+        self.context.add_llm_tools(
+            FunctionTool(
+                name="meme_library",
+                description=(
+                    "管理爱丽丝的共享表情图库。先看称呼、@对象和上下文，确认用户在请爱丽丝删除；对其他人的请求不操作自己的图库。"
+                    "recent 只查询当前聊天最近实际发出的表情，按时间从近到远，不是已收藏列表；"
+                    "recent 里没有某张不代表没有收藏，用户引用或附图时用 inspect；"
+                    "inspect 精确识别当前消息或其引用中的图，批量消息用 quote_index 选择请求；"
+                    "delete 按查询得到的 meme_id 删除一张，会影响全部聊天以后的选图。"
+                    "删除图库表情不是撤回QQ消息；失败时如实说明。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["recent", "inspect", "delete"],
+                        },
+                        "meme_id": {
+                            "type": "string",
+                            "description": "delete 时填写 recent/inspect 返回的准确 ID。",
+                        },
+                        "quote_index": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "inspect 时，当前批次里请求删除表情的那条消息序号。",
+                        },
+                    },
+                    "required": ["action"],
+                    "additionalProperties": False,
+                },
+                handler=type(self)._handle_meme_library_tool,
+            )
+        )
+
+    async def _handle_meme_library_tool(
+        self,
+        event: AstrMessageEvent,
+        action: str,
+        meme_id: str = "",
+        quote_index: int | None = None,
+    ) -> str:
+        """Expose sticker management to AstrBot's registered tool handler.
+
+        Args:
+            event: Current conversation event.
+            action: Lookup or deletion operation selected by the model.
+            meme_id: Exact reference from a previous lookup.
+            quote_index: Optional request index in a mem_chat reply batch.
+
+        Returns:
+            The actual lookup or deletion outcome as JSON.
+        """
+        return await self.llm_client._manage_meme_library(
+            event, action=action, meme_id=meme_id, quote_index=quote_index
+        )
 
     def _register_codex_tool(self):
         """Register the owner-only Codex bridge as a native LLM tool."""
@@ -2669,6 +2891,7 @@ class MemChat(Star):
                     is_private=not bool(event.get_group_id()),
                 )
                 meta["is_directed"] = bool(is_at)
+                meta["wake_reason"] = wake_reason
                 meta["msg_id"] = str(msg_id or "").strip()
                 meta["text"] = str(text_with_images or "")
                 try:
@@ -2706,6 +2929,9 @@ class MemChat(Star):
         # 5. Check if Command (Ignore)
         if getattr(event, "is_command", False):
             return
+
+        if event.get_group_id():
+            self.scheduler.note_group_activity(umo, event)
 
         # Private chat only: let the optional scene coordinator observe this
         # turn. It cancels stale autonomous timers and, when a scene is already

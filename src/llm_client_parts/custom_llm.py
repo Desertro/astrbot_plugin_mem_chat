@@ -29,7 +29,11 @@ def _openai_supports_image_url(base_url: str, model: str) -> bool:
     # The current DeepSeek Flash alias and the legacy vision model accept images.
     if _is_deepseek_openai_target(base_url, model):
         model_name = str(model or "").lower()
-        return model_name == "deepseek-flash" or "vision" in model_name
+        return (
+            model_name == "deepseek-flash"
+            or model_name.startswith("deepseek-v4.1-flash")
+            or "vision" in model_name
+        )
     return True
 
 

@@ -195,3 +195,150 @@ async def test_normal_completion_does_not_retry(client):
     )
     await asyncio.sleep(0)
     client._call_custom_llm.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "origin, persona_phase", [("name_call", "read_air"), ("platform_at", "at")]
+)
+async def test_name_candidate_uses_provisional_persona_and_preserves_confirmation(
+    client, origin, persona_phase
+):
+    from src.core.scheduler import Scheduler
+    from src.core.state import MemChatState
+
+    state = MemChatState()
+    client.plugin.state = state
+    client.plugin.scheduler = Scheduler(None, None, {}, state, None, None)
+    event = SimpleNamespace(
+        get_group_id=lambda: "42", _mem_chat_attention_origin=origin
+    )
+    phases = []
+
+    def build_system(*args, **kwargs):
+        phases.append(kwargs["task_type"])
+        return "system"
+
+    client._build_system_prompts = build_system
+    client._call_custom_llm = AsyncMock(
+        return_value=response(
+            json.dumps(
+                {
+                    "control": {"decision": "reply_only", "addressed": False},
+                    "response": {"text": "understood"},
+                }
+            )
+        )
+    )
+    try:
+        assert await client.invoke_llm(
+            "default:GroupMessage:42",
+            "甲对乙说：爱丽丝是对的",
+            "",
+            event=event,
+            task_type="at",
+        )
+        assert phases and set(phases) == {persona_phase}
+        assert event._mem_chat_last_structured_payload["control"]["addressed"] is False
+        sent_prompt = client._call_custom_llm.await_args.kwargs["prompt"]
+        assert ("control.addressed" in sent_prompt) is (origin == "name_call")
+    finally:
+        client.plugin.scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("custom", [True, False])
+@pytest.mark.parametrize(
+    "model,expected",
+    [
+        ("deepseek-flash", True),
+        ("deepseek-v4.1-flash", True),
+        ("gemini-3.8-flash", False),
+        ("deepseek-chat", False),
+    ],
+)
+async def test_model_style_survives_tools_and_protocol_retry(
+    client, custom, model, expected
+):
+    """Apply the exact model-specific style through continuation and retry."""
+    from pathlib import Path
+
+    style = (
+        (Path(__file__).resolve().parents[1] / "personas" / "deepseek_flash_style.txt")
+        .read_text(encoding="utf-8")
+        .strip()
+    )
+    calls = []
+    completions = iter([response("", tool=True), response(BAD), response(GOOD)])
+
+    async def generate(**kwargs):
+        calls.append(copy.deepcopy(kwargs))
+        return next(completions)
+
+    config = client._prepare_llm_config(None, None)
+    config["llm"]["model"] = model
+    config["provider"] = SimpleNamespace(text_chat=generate, get_model=lambda: model)
+    config["use_custom_llm"] = custom
+    client._prepare_llm_config = lambda *_args: config
+    client._call_custom_llm = generate
+    tool = SimpleNamespace(tools=[SimpleNamespace(name="audit_tool")])
+    client._setup_tools = lambda *_args: (tool, True)
+    client._split_history_into_contexts = lambda *_args: (
+        "history stripped",
+        [{"role": "user", "content": "earlier"}],
+    )
+    client.plugin.config["history_as_role_contexts"] = True
+    assert await client.invoke_llm(
+        "default:FriendMessage:audit-protocol", "hello", "history"
+    )
+    await asyncio.sleep(0)
+    assert len(calls) == 3
+    for call in calls:
+        assert call["system_prompt"].count(style) == int(expected)
+    client._execute_agent_tool.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_optional_group_bubble_does_not_advertise_or_run_tools(client):
+    """Keep spontaneous expression separate from actions requested by old context."""
+    from src.core.scheduler import Scheduler
+    from src.core.state import MemChatState
+
+    client.plugin.state = MemChatState()
+    client.plugin.state.set_self_id("default:GroupMessage:42", "audit-bot")
+    client.plugin.scheduler = Scheduler(
+        client.plugin,
+        client.plugin.context,
+        client.plugin.config,
+        client.plugin.state,
+        None,
+        client,
+    )
+    offered = SimpleNamespace(tools=[SimpleNamespace(name="audit_tool")])
+    client._setup_tools = lambda *_args: (offered, True)
+    client._call_custom_llm = AsyncMock(return_value=response(GOOD))
+    event = SimpleNamespace(
+        _mem_chat_group_bubble_revision=1,
+        get_group_id=lambda: "42",
+        get_sender_id=lambda: "system",
+    )
+    assert (
+        await client.invoke_llm(
+            "default:GroupMessage:42",
+            "Already-read background; optional bubble.",
+            "",
+            event=event,
+            task_type="read_air",
+            user_msgs_to_save=[],
+            impression_mode="off",
+        )
+        is True
+    )
+    assert client._call_custom_llm.await_args.kwargs["tools"] is None
+    client._execute_agent_tool.assert_not_awaited()
+    saved = (
+        client.plugin.context.conversation_manager.update_conversation.await_args.args[
+            2
+        ]
+    )
+    assert all(item["role"] == "assistant" for item in saved)

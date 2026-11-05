@@ -57,6 +57,46 @@
     ],
     "hint": "选择请求格式"
   },
+  "llm_fallback": {
+    "type": "object",
+    "description": "默认对话接口的故障备用",
+    "hint": "默认对话主接口失败、空响应或35秒超时后启用，备用最多等待20秒；独立识图和指定Gemini群不受影响。",
+    "items": {
+      "enable": {
+        "type": "bool",
+        "description": "启用对话备用接口",
+        "default": false
+      },
+      "base_url": {
+        "type": "string",
+        "description": "备用对话API地址",
+        "default": ""
+      },
+      "api_key": {
+        "type": "string",
+        "description": "备用对话API密钥",
+        "default": ""
+      },
+      "model": {
+        "type": "string",
+        "description": "备用对话模型",
+        "default": ""
+      },
+      "format": {
+        "type": "string",
+        "description": "备用对话请求格式",
+        "default": "openai",
+        "options": [
+          "openai",
+          "google"
+        ],
+        "labels": [
+          "OpenAI格式",
+          "Google Gemini格式"
+        ]
+      }
+    }
+  },
   "llm_temperature": {
     "description": "对话 LLM温度 (0.0-2.0)",
     "type": "float",
@@ -116,6 +156,12 @@
     "default": 30,
     "hint": "限制为 1～60 秒，超时后将错误交给模型处理。"
   },
+  "capability_agent_timeout_sec": {
+    "description": "plugin_agent 子代理超时秒数",
+    "type": "int",
+    "default": 600,
+    "hint": "30～900 秒。子代理会串联模型决策和生图，必须比普通工具超时更长。"
+  },
   "provider_settings": {
     "description": "外部工具提供方设置",
     "type": "object",
@@ -158,6 +204,30 @@
     "type": "bool",
     "default": true,
     "hint": "关闭后仅在 @ / 专注模式触发回复，不再进行读空气判定与定时回复。"
+  },
+  "activity_scheduling_enabled": {
+    "type": "bool",
+    "description": "按近期群聊活跃度调节观察频率",
+    "default": true,
+    "hint": "使用近2分钟和10分钟的人类发言速度，不按群成员数量区分。普通消息45至180秒内判断，1条也能处理；保留@、回复和叫名的快速路径及focus降温。开启后忽略旧人数倍率和逐群倍率。"
+  },
+  "group_bubble_enabled": {
+    "type": "bool",
+    "description": "允许低频自主冒泡",
+    "default": true,
+    "hint": "每群45至90分钟一次可选判断，最近20分钟有人活动且爱丽丝已安静至少45分钟时才考虑。LLM可保持沉默；无人聊天不调用，同一批背景只尝试一次。"
+  },
+  "group_bubble_interval_min_sec": {
+    "type": "int",
+    "description": "冒泡机会最短间隔（秒）",
+    "default": 2700,
+    "hint": "下限2700秒。主动机会与爱丽丝实际发言都参与限频。"
+  },
+  "group_bubble_interval_max_sec": {
+    "type": "int",
+    "description": "冒泡机会最长随机间隔（秒）",
+    "default": 5400,
+    "hint": "在最短到最长间隔之间随机安排，这是判断机会而非定时必发。"
   },
   "heartbeat_cycle": {
     "description": "心跳周期(秒)",
@@ -992,7 +1062,16 @@
     "description": "允许成人场景内容",
     "type": "bool",
     "default": true,
-    "hint": "关闭后普通持续角色扮演/陪伴场景仍可用，但禁止成人内容。成人内容仅限双方明确同意的成年人私聊。"
+    "hint": "成人内容总开关。即使开启，也只有 adult_group_whitelist 中的群聊可使用完整成人人设；其他群聊和私聊一律降级为擦边模式。"
+  },
+  "adult_group_whitelist": {
+    "description": "完整成人人设群聊白名单（Group ID 列表）",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "只有列表中的群聊会加载完整成人人设；其他群聊和私聊只能擦边。留空时全部会话都只能擦边。"
   },
   "scene_max_duration_sec": {
     "description": "单次场景最长持续时间（秒）",
@@ -1154,25 +1233,26 @@
   "large_group_frequency_enabled": {
     "description": "按群人数降低自动回复频率",
     "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "旧版配置：仅关闭 activity_scheduling_enabled 后生效。"
   },
   "large_group_member_threshold": {
     "description": "大群人数阈值",
     "type": "int",
     "default": 100,
-    "hint": "群人数达到该值后启用降频；显式 @ 不受影响。"
+    "hint": "旧版配置：仅关闭 activity_scheduling_enabled 后生效。群人数达到该值后启用降频；显式 @ 不受影响。"
   },
   "large_group_heartbeat_multiplier": {
     "description": "大群心跳与专注周期倍数",
     "type": "float",
     "default": 1.8,
-    "hint": "大群 READ_AIR 等待时间和 FOCUS 回复周期乘以该值，范围 1～5。"
+    "hint": "旧版配置：仅关闭 activity_scheduling_enabled 后生效。大群 READ_AIR 等待时间和 FOCUS 回复周期乘以该值，范围 1～5。"
   },
   "large_group_min_message_bonus": {
     "description": "大群读空气最低消息数增量",
     "type": "int",
     "default": 5,
-    "hint": "在 decision_msg_count_min 基础上额外要求这么多条消息。"
+    "hint": "旧版配置：仅关闭 activity_scheduling_enabled 后生效。在 decision_msg_count_min 基础上额外要求这么多条消息。"
   },
   "large_group_focus_duration_cap_sec": {
     "description": "大群专注模式时长上限（秒）",
@@ -1247,7 +1327,35 @@
   },
   "read_air_transition_step_sec": {
     "type": "int",
-    "description": "降温每轮增加的等待（秒）",
-    "default": 20
+    "description": "旧版降温每轮增量（已弃用）",
+    "default": 20,
+    "hint": "现按实际经过时间线性降温，改用 read_air_transition_duration_sec。"
+  },
+  "read_air_transition_duration_sec": {
+    "type": "int",
+    "description": "专注结束后回到常规读空气间隔所需时间（秒）",
+    "default": 300,
+    "hint": "等待间隔与消息量门槛随实际时间逐渐增加；主动插话不会重置降温，大群倍率不拉长这段时长。"
+  },
+  "vision_chat_groups": {
+    "type": "list",
+    "description": "使用识图模型作为主对话模型的群",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "填写群号；这些群复用 meme_vision 的站点和密钥，模型由 vision_chat_model 指定，留空时沿用识图模型。通过 OpenAI 兼容接口直接接收本轮原图，其他群及私聊保留全局主模型。"
+  },
+  "vision_chat_model": {
+    "type": "string",
+    "description": "指定群的可视对话模型",
+    "default": "",
+    "hint": "仅作用于 vision_chat_groups；留空沿用 meme_vision.model。填写时复用识图站点和密钥，不改变图片描述与表情选择的独立模型。"
+  },
+  "group_frequency_overrides": {
+    "type": "dict",
+    "description": "指定群的自动跟聊频率",
+    "default": {},
+    "hint": "以群号为键。活动调度使用 activity_cycle_multiplier（1～5，普通观察及focus周期倍率，默认1）；倍率大于1时focus下限不低于放大后的基准。可设 focus_non_at_use_decision_prompt=true，让未被点名的focus先判断是否需要回复。旧 cycle_multiplier 和 min_message_bonus 仅在关闭活动调度后生效。@、引用回复和名称呼唤仍走快速通道。"
   }
 }

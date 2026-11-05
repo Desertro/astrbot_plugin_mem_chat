@@ -366,5 +366,66 @@ async def test_complete_release_batch_starts_short_read_air_cycle(scheduler):
     await scheduler.task_queues[UMO].put(ReplyTask(UMO, 0, "focus", event=event))
     await scheduler._process_reply_queue(UMO)
     assert not scheduler.state.is_in_focus(UMO)
-    assert scheduler._read_air_wait_seconds(UMO) == 20
-    assert scheduler.trigger_view_cycle.await_args.args[1] == "read_air"
+    assert scheduler._read_air_wait_seconds(UMO) == pytest.approx(20, abs=0.01)
+    scheduler.trigger_view_cycle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_platform_at", [False, True])
+async def test_complete_batch_uses_strongest_call_origin(
+    scheduler, include_platform_at
+):
+    scheduler._enter_read_air(UMO)
+    if include_platform_at:
+        add_message(scheduler.state, "at", "@bot help", directed=True)
+    add_message(scheduler.state, "name", "爱丽丝是对的", directed=True)
+    meta = scheduler.state.get_message_meta(UMO, "name")
+    meta["wake_reason"] = "name_call"
+    scheduler.state.set_message_meta(UMO, "name", meta)
+    add_message(scheduler.state, "tail", "unrelated chat")
+    event = Event("name", "爱丽丝是对的")
+    event._mem_chat_wake_reason = "name_call"
+    origins = []
+
+    async def invoke(*args, **kwargs):
+        origins.append(kwargs["event"]._mem_chat_attention_origin)
+        kwargs["event"]._mem_chat_last_send_ok = True
+        kwargs["event"]._mem_chat_last_structured_payload = {
+            "control": {"decision": "reply_only", "addressed": False},
+            "response": {"text": "understood"},
+        }
+        return True
+
+    scheduler.llm_client.invoke_llm.side_effect = invoke
+    try:
+        await scheduler.task_queues[UMO].put(ReplyTask(UMO, 0, "at", event=event))
+        await scheduler._process_reply_queue(UMO)
+        assert origins == ["platform_at" if include_platform_at else "name_call"]
+        assert scheduler.state.is_in_focus(UMO) is include_platform_at
+        assert scheduler.state.get_pending_count(UMO) == 0
+    finally:
+        scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_complete_ambient_reply_keeps_cooling_clock(scheduler):
+    scheduler._enter_read_air(UMO)
+    scheduler._read_air_started_at[UMO] -= 150
+    started = scheduler._read_air_started_at[UMO]
+    add_message(scheduler.state, "a", "new cat sticker")
+
+    async def invoke(*args, **kwargs):
+        kwargs["event"]._mem_chat_last_send_ok = True
+        kwargs["event"]._mem_chat_last_structured_payload = {
+            "control": {"decision": "reply_only"},
+            "response": {"text": "cute cat"},
+        }
+        return True
+
+    scheduler.llm_client.invoke_llm.side_effect = invoke
+    await scheduler.task_queues[UMO].put(ReplyTask(UMO, 0, "read_air", event=Event()))
+    await scheduler._process_reply_queue(UMO)
+    assert not scheduler.state.is_in_focus(UMO)
+    assert scheduler._read_air_started_at[UMO] == started
+    assert scheduler.state.get_pending_count(UMO) == 0
+    scheduler.trigger_view_cycle.assert_not_awaited()

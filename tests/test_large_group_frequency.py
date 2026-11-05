@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def make_scheduler(**overrides):
     config = {
+        "activity_scheduling_enabled": False,
         "heartbeat_cycle": 300,
         "decision_msg_count_min": 5,
         "decision_msg_count_max": 200,
@@ -82,3 +83,52 @@ def test_schema_declares_codex_and_large_group_settings():
         "large_group_focus_duration_cap_sec",
     ):
         assert key in schema
+
+
+def test_group_frequency_override_isolated_and_independent_of_member_cache():
+    scheduler, state = make_scheduler(
+        group_frequency_overrides={
+            "100": {"cycle_multiplier": 2.4, "min_message_bonus": 8}
+        }
+    )
+    target = "default:GroupMessage:100"
+    other = "default:GroupMessage:200"
+    state.set_group_member_count("200", 150)
+    assert scheduler._read_air_wait_seconds(target) == 720
+    assert scheduler._read_air_min_messages(target) == 13
+    assert scheduler._focus_cycle_bounds(target)[3] == 36
+    assert scheduler._read_air_wait_seconds(other) == 540
+    assert scheduler._read_air_min_messages(other) == 10
+    assert scheduler._read_air_wait_seconds("default:FriendMessage:100") == 300
+    assert scheduler._read_air_wait_seconds("default:GroupMessage:1000") == 300
+
+
+def test_group_frequency_override_keeps_elapsed_linear_cooling(monkeypatch):
+    scheduler, _state = make_scheduler(
+        group_frequency_overrides={"100": {"cycle_multiplier": 2.4}},
+        read_air_transition_start_sec=20,
+        read_air_transition_step_sec=20,
+    )
+    umo = "default:GroupMessage:100"
+    clock = [1000.0]
+    monkeypatch.setattr("src.core.scheduler.time.monotonic", lambda: clock[0])
+    scheduler._enter_read_air(umo)
+    assert scheduler._read_air_wait_seconds(umo) == 48
+    assert scheduler._read_air_min_messages(umo) == 1
+    clock[0] += 150
+    assert scheduler._read_air_wait_seconds(umo) == 384
+    assert scheduler._read_air_min_messages(umo) == 5
+    clock[0] += 150
+    assert scheduler._read_air_wait_seconds(umo) == 720
+    assert scheduler._read_air_min_messages(umo) == 10
+
+
+def test_group_frequency_override_respects_disable_and_clamps_multiplier():
+    scheduler, _state = make_scheduler(
+        group_frequency_overrides={"100": {"cycle_multiplier": 99}}
+    )
+    umo = "default:GroupMessage:100"
+    assert scheduler._large_group_multiplier(umo) == 5
+    scheduler.config["large_group_frequency_enabled"] = False
+    assert scheduler._large_group_multiplier(umo) == 1
+    assert scheduler._read_air_min_messages(umo) == 5

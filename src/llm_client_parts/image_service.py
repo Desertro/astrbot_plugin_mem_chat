@@ -8,10 +8,13 @@ import tempfile
 import time
 from collections import deque
 from collections.abc import Callable
+from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlparse
 
 import aiohttp
+
+from .meme_library import MemeLibrary
 
 logger = logging.getLogger("astrbot")
 
@@ -124,6 +127,7 @@ class ImageService:
         self._get_cwd = get_cwd or os.getcwd
         self._user_daily_images: dict[str, dict[str, set[str]]] = {}
         self._recent_meme_paths: dict[str, deque[str]] = {}
+        self.meme_library = MemeLibrary(Path(self._get_cwd()) / "data" / "memes_data")
 
     def normalize_image_key(self, url: str) -> str:
         u = (url or "").strip("`\"' ")

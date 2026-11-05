@@ -33,7 +33,6 @@ mem_chat.db-*
 faiss/
 knowledge/
 temp/
-persona_rag/
 data/
 logs/
 
@@ -56,3 +55,8 @@ logs/
 # Local audit outputs and affinity backups
 media_caption_backfill_*.json
 mem_chat_affinity_backup_*.json
+
+# Persona RAG source corpora are versioned; generated indexes remain local.
+!persona_rag/
+!persona_rag/*.md
+!persona_rag/*.txt

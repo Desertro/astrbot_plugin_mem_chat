@@ -1,6 +1,91 @@
+## 2026-11-05 更新 (Adult Persona Scope and Persona RAG)
+
+- 完整成人人设改为白名单群专用：只有 `scene_adult_mode` 开启且当前群在 `adult_group_whitelist` 中时才加载完整设定。
+- 其他群聊和所有私聊在运行时降级为擦边模式，保留调情、荤段子、双关和暧昧接话，但禁止露骨情节；当前部署的具体群号仅保存在 AstrBot 本地配置中。
+- 仓库加入爱丽丝剧情与对话 RAG 源语料及说明，便于重新部署时恢复人格检索；大型数据库与生成的 FAISS 索引仍留在本地，不提交到 Git。
+
+## 2026-11-05: Reduce kei unsolicited participation
+
+- Honor explicit activity timing overrides without changing other groups or directed-call batching.
+- Keep scaled focus timing above its baseline; allow per-group reply-or-silence prompts for unaddressed focus turns.
+- Leave mem_chat disabled during emergency review while other AstrBot plugins continue running.
+
+## 2026-11-05 更新 (Activity Scheduling and Optional Bubbles)
+
+- Group observation follows two-minute and ten-minute human message rates rather than member counts. Adjacent sentence fragments are merged for traffic estimates; images and stickers still count.
+- Ordinary messages receive a decision after 45–180 seconds without a minimum batch-size gate. Direct calls retain their priority, and focus cools gradually.
+- Replaced large-group participation warnings with measured traffic context. The dialogue model can naturally participate or remain silent.
+- Optional bubble opportunities occur 45–90 minutes apart, require recent human activity and sustained assistant silence, and never reconsume already-read input. Stale bubbles yield to new messages.
+
+## 2026-11-05 更新 (AGIC DeepSeek Failover)
+
+- Default dialogue uses AGIC DeepSeek v4.1 Flash first and keeps the previous endpoint as an explicit fallback.
+- Failed or empty primary requests fall back within a 55-second budget; native tool calls remain valid responses.
+- Dedicated vision and Gemini group routes remain isolated; DeepSeek v4.1 Flash aliases retain image input.
+
 # 更新记录
 
+## 2026-11-05 更新 (Gemini Group Trial)
+
+- 增加指定群的可视对话模型选项，复用识图站点和密钥，允许群聊对话模型与独立图片描述模型分别选择；留空保留原有行为。
+- 本地试运行：kei、幻夜、二刺螈发电站使用 gemini-4-argon；kei 稳态检查约六分钟、七条消息，保留模型自主决定是否回复。
+
+## 2026-11-04 更新 (Kei Princess Pretext)
+
+- 将“为了王女”细化为恋爱二创互动：两人都对老师有好感，凯伊借保护王女主动争取独处，兼有对爱丽丝的心虚和不愿放弃约定的嘴硬。
+- 调整对应例句，补充爱丽丝的主动邀请与轻微吃醋，保留两人互相关心及明确切换人格的规则。
+
+## 2026-11-04 更新 (Alice and Kei Everyday Reactions)
+
+- 将爱丽丝的游戏联想、学梗、小得意、女仆清扫、暴击与熟人反差融入日常反应，补充改写示例；将原有互怼规则标清为互怼反差，避免限制日常表达。
+- 扩展凯伊的嘴硬关心、王女借口、被夸害羞、旧时代资历和机体相关玩笑，区分原作反应与二创演绎，保留明确切换人格及独立自称。
+- 梗按当前话题与关系自然使用；示例不作为固定回复，也不据此自动切换或同时扮演两个人格。
+
+## 2026-11-04 更新 (DeepSeek Flash Reply Style)
+
+- 为 DeepSeek 4.1 Flash 的对话回复单独加载用户提供的十条中文表达要求，保留原文；工具续答和协议异常重试沿用同一要求，其他模型保持原提示词。
+- 实测后为插件输出图片补充来源与原图组编号，避免把动图抽帧误认为用户另发的新图片；文字描述失败时仍可依据本轮附带的原图回答。
+- 修复收藏图片转成 JPEG 后无法按原始图片删除的问题，通过保存时的原图内容指纹精确匹配；查询最近发送记录时明确其不等于全部收藏。
+
+## 2026-11-04 更新 (Companion Plugin Awareness)
+
+- 常驻设定增加同账号配套模块的认知，理解链接解析、手办化和图片生成是连接本身的日常能力；自动触发的结果保留实际来源。
+- 解析器和手办化回填触发者、原消息、执行与发送状态及图片。图片独立留存，按需识别并缓存描述，下一轮对话可直接接续。
+- AstrBot 发送阶段向发送后钩子提供实际成功发出的组件，避免把生成成功误记为发送成功。
+- 活动按会话隔离并限量注入，不触发回复或 Focus；活动及无引用图片保留七天。
+
+
+## 2026-11-04 更新 (Natural Language Sticker Deletion)
+
+- 新增原生工具 `meme_library`：LLM 可查询当前聊天实际发出的表情，或精确匹配消息/引用中的图，再删除指定表情并根据真实结果确认。
+- 发送成功后持久化原图库文件与实际缩图的对应记录；群聊按本轮请求的引用定位，无法确定时不自动拿最近一张代替。
+- 删除时同步移除共享图库文件、向量索引与细分类标签，并刷新缓存；原文件及索引存入图库外的恢复目录，数据库操作失败会回滚。
+
+
 本文保留原首页的更新记录，按原有编排归档，日期未重新排序。记录反映各次修改时的行为；当前使用入口见 [首页](README.md)，具体配置以 [_conf_schema.json](_conf_schema.json) 为准。
+
+## 2026-11-04 更新 (Group Participation and Cooling)
+
+- 保留 @、引用回复和名称候选的快速判断；名称命中不再提前刷新 focus，由模型通过 `control.addressed` 确认是否在直接对话。
+- 普通主动插话不再自动进入 focus 或重置降温，仍可由模型显式延长关注；同批真实 @ 优先于名称提及与普通尾消息。
+- 降温按实际时间线性增长，默认 5 分钟内达到本群常规间隔，消息量门槛同步提高；弃用旧按轮次增量配置。
+- 增加主动发言、名称提及、混合批次、有限重试和时间降温的回归验证。
+
+## 2026-11-03 更新 (Daily Persona Expansion)
+
+- 为常驻人设补充爱丽丝的外貌、自我认知、勇者动机、游戏与日常偏好，以及与游戏开发部、优香、凯伊和当前聊天对象的关系。
+- 区分爱丽丝本体、凯伊独立机体和接管同一身体的情形，说明旧聊天误认不改变基本外貌常识。
+- 增加日常情绪的表现方式和十二组短对话示例；保留现有跨世界投影设定与状态选择机制。
+
+## 2026-11-03 更新 (Own Sticker Preference)
+
+- 看图选表情时，在情绪、文字、态度和强度同样贴切的候选中优先选择天童爱丽丝本人的表情，再考虑近期使用情况；没有合适本人表情时仍可选其他角色。
+- 人物身份以实际画面为依据，区分爱丽丝与凯伊；保留现有情绪匹配、原图复核和指定表情文字的选择逻辑。
+
+## 2026-11-03 更新 (Group Model Routing)
+
+- 新增 `vision_chat_groups`，指定群复用独立识图站点作为主对话模型，并沿用原图输入；其他会话保持全局主模型。
+- 新增 `group_frequency_overrides`，可单独调整指定群的周期倍率和稳态读空气消息门槛，保留既有 @、名称呼唤与线性降温机制。
 
 ## 2026-11-03 更新 (Friendly Daily Tone)
 

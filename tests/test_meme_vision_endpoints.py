@@ -154,3 +154,140 @@ async def test_human_reviewed_caption_survives_model_misread(tmp_path):
     assert (
         prompt["candidates"][0]["human_reviewed_description"] == result["description"]
     )
+
+
+@pytest.mark.parametrize(
+    "umo,expected",
+    [
+        ("default:GroupMessage:1042128452", "gemini-3.8-flash"),
+        ("aiocqhttp:GroupMessage:1042128452", "gemini-3.8-flash"),
+        ("default:GroupMessage:72208748", "deepseek-flash"),
+        ("default:GroupMessage:1080344345", "deepseek-flash"),
+        ("default:FriendMessage:1042128452", "deepseek-flash"),
+        ("default:GroupMessage:10421284520", "deepseek-flash"),
+    ],
+)
+def test_vision_chat_route_isolated_to_exact_group(umo, expected):
+    config = {
+        "llm_base_url": "https://dialogue.example/v1",
+        "llm_api_key": "dialogue-only",
+        "llm_model": "deepseek-flash",
+        "llm_format": "openai",
+        "vision_chat_groups": ["1042128452"],
+        "meme_vision": {
+            "enable": True,
+            "base_url": "https://vision.example/v1",
+            "api_key": "vision-only",
+            "model": "gemini-3.8-flash",
+        },
+    }
+    context = SimpleNamespace(get_using_provider=lambda **_: None)
+    client = LLMClient(SimpleNamespace(config=config, context=context))
+    result = client._prepare_llm_config(umo, None)
+    assert result["llm"]["model"] == expected
+    assert result["llm"]["fmt"] == "openai"
+    assert result["llm"]["key"] == (
+        "vision-only" if expected.startswith("gemini") else "dialogue-only"
+    )
+    assert config["llm_model"] == "deepseek-flash"
+    assert config["llm_api_key"] == "dialogue-only"
+
+
+@pytest.mark.parametrize(
+    "vision", [{"enable": False}, {"enable": True, "model": "gemini-3.8-flash"}]
+)
+def test_unavailable_vision_chat_keeps_complete_default_endpoint(vision):
+    context = SimpleNamespace(get_using_provider=lambda **_: None)
+    config = {
+        "llm_base_url": "https://dialogue.example/v1",
+        "llm_api_key": "dialogue-only",
+        "llm_model": "deepseek-flash",
+        "vision_chat_groups": ["1042128452"],
+        "meme_vision": vision,
+    }
+    client = LLMClient(SimpleNamespace(config=config, context=context))
+    result = client._prepare_llm_config("default:GroupMessage:1042128452", None)
+    assert result["llm"]["base"] == "https://dialogue.example/v1"
+    assert result["llm"]["key"] == "dialogue-only"
+    assert result["llm"]["model"] == "deepseek-flash"
+
+
+@pytest.mark.asyncio
+async def test_vision_chat_transmits_real_image_to_selected_endpoint(
+    endpoints, tmp_path
+):
+    base, calls = endpoints
+    image = tmp_path / "native-input.png"
+    Image.new("RGB", (80, 40), "blue").save(image)
+    config = {
+        "llm_base_url": base + "/wrong-endpoint",
+        "llm_api_key": "dialogue-only",
+        "llm_model": "deepseek-flash",
+        "custom_llm_format": "google",
+        "vision_chat_groups": ["1042128452"],
+        "meme_vision": {
+            "enable": True,
+            "base_url": base,
+            "api_key": "vision-only",
+            "model": "gemini-3.8-flash",
+        },
+    }
+    context = SimpleNamespace(get_using_provider=lambda **_: None)
+    client = LLMClient(SimpleNamespace(config=config, context=context))
+    cfg = client._prepare_llm_config("default:GroupMessage:1042128452", None)["llm"]
+    response = await client._call_custom_llm(
+        base_url=cfg["base"],
+        api_key=cfg["key"],
+        model=cfg["model"],
+        system_prompt="Read the actual image.",
+        prompt="What color is the image?",
+        contexts=[{"role": "assistant", "content": "Prior conversation"}],
+        image_urls=[str(image)],
+        fmt=cfg["fmt"],
+    )
+    assert response.completion_text
+    assert len(calls) == 1
+    path, authorization, body = calls[0]
+    assert path == "/v1/chat/completions"
+    assert authorization == "Bearer vision-only"
+    assert body["model"] == "gemini-3.8-flash"
+    assert body["messages"][1] == {"role": "assistant", "content": "Prior conversation"}
+    inputs = body["messages"][-1]["content"]
+    image_inputs = [part for part in inputs if part.get("type") == "image_url"]
+    assert len(image_inputs) == 1
+    assert image_inputs[0]["image_url"]["url"].startswith("data:image/")
+
+
+@pytest.mark.parametrize(
+    "umo,expected",
+    [
+        ("default:GroupMessage:1042128452", "gemini-4-argon"),
+        ("default:GroupMessage:72208748", "gemini-4-argon"),
+        ("default:GroupMessage:775066874", "gemini-4-argon"),
+        ("default:GroupMessage:1080344345", "deepseek-flash"),
+        ("default:FriendMessage:775066874", "deepseek-flash"),
+    ],
+)
+def test_vision_chat_model_override_keeps_caption_and_default_models(umo, expected):
+    config = {
+        "llm_base_url": "https://dialogue.example/v1",
+        "llm_api_key": "dialogue-only",
+        "llm_model": "deepseek-flash",
+        "vision_chat_groups": ["1042128452", "72208748", "775066874"],
+        "vision_chat_model": "gemini-4-argon",
+        "meme_vision": {
+            "enable": True,
+            "base_url": "https://vision.example/v1",
+            "api_key": "vision-only",
+            "model": "gemini-3.8-flash",
+        },
+    }
+    context = SimpleNamespace(get_using_provider=lambda **_: None)
+    client = LLMClient(SimpleNamespace(config=config, context=context))
+    result = client._prepare_llm_config(umo, None)
+    assert result["llm"]["model"] == expected
+    assert result["llm"]["key"] == (
+        "vision-only" if expected == "gemini-4-argon" else "dialogue-only"
+    )
+    assert config["meme_vision"]["model"] == "gemini-3.8-flash"
+    assert config["llm_model"] == "deepseek-flash"

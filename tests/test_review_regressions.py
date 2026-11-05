@@ -32,7 +32,8 @@ def load_module(name, path):
 
 
 image_module = load_module(
-    "review_image_service", PLUGIN / "src/llm_client_parts/image_service.py"
+    "src.llm_client_parts.review_image_service",
+    PLUGIN / "src/llm_client_parts/image_service.py",
 )
 db_module = load_module("review_database", PLUGIN / "src/db/database.py")
 
@@ -311,7 +312,7 @@ async def test_selected_meme_metadata_keeps_original_after_resize(service, emoti
     assert selected == {}
 
 
-def test_private_prompt_uses_private_scope_and_warmth_rules():
+def test_private_prompt_uses_private_scope_and_teasing_boundary():
     sys.path.insert(0, str(PLUGIN))
     try:
         from src.llm_client import LLMClient
@@ -328,7 +329,8 @@ def test_private_prompt_uses_private_scope_and_warmth_rules():
     assert "【私聊技能总模板" in instructions
     assert "群聊技能总模板" not in instructions
     assert "私聊里对方的话默认是在对你说" in instructions
-    assert "第一轮就积极接住" in instructions
+    assert "当前只能擦边" in instructions
+    assert "不升级为露骨成人内容" in instructions
     assert "R2." in instructions
 
     private_system = client._build_system_prompts(
@@ -336,6 +338,9 @@ def test_private_prompt_uses_private_scope_and_warmth_rules():
     )
     assert "要不要开口｜私聊" in private_system
     assert "不要当群聊旁白" in private_system
+    assert "当前只能擦边" in private_system
+    assert "不进入露骨成人场景" in private_system
+    assert "当前会话尺度｜擦边模式" in private_system
 
     group_system = client._build_system_prompts(None, "", "default:GroupMessage:20002")
     assert "先做出情绪反应" in group_system
@@ -349,9 +354,8 @@ def test_private_prompt_uses_private_scope_and_warmth_rules():
         assert "引用他人原话时保留原有称谓" in prompt
     assert "普通群聊保持原设语气" in group_system
 
-
 def test_persona_is_friendly_by_default_and_proactive_in_erotic_mode():
-    """Guard the current persona direction against regressions."""
+    """Guard the persona direction and its whitelist-only adult scope."""
     sys.path.insert(0, str(PLUGIN))
     try:
         from src.llm_client import LLMClient
@@ -363,7 +367,15 @@ def test_persona_is_friendly_by_default_and_proactive_in_erotic_mode():
         get_self_id=lambda _umo: "",
         get_self_name=lambda _umo: "",
     )
-    client = LLMClient(SimpleNamespace(config={}, state=state))
+    client = LLMClient(
+        SimpleNamespace(
+            config={
+                "scene_adult_mode": True,
+                "adult_group_whitelist": ["775066874"],
+            },
+            state=state,
+        )
+    )
     rules = client._load_state_rules()
     assert "默认对普通群友友善" in rules["read_air"]
     assert "先对消息本身有反应" in rules["read_air"]
@@ -379,7 +391,7 @@ def test_persona_is_friendly_by_default_and_proactive_in_erotic_mode():
     assert "人味不等于完整短评" in persona
     assert "自称统一使用“爱丽丝”" in persona
     assert "不用“我”或“人家”自称" in persona
-    assert "Kei用“我”自称时指Kei自己" in persona
+    assert "明确切换为凯伊（Kei）时" in persona
     assert "凯伊保留独立自称" in persona
     assert "不要每句都重复" in persona
     assert "原设日常语气" in persona
@@ -393,14 +405,86 @@ def test_persona_is_friendly_by_default_and_proactive_in_erotic_mode():
         None, "", "default:FriendMessage:10001"
     )
     assert "普通正常互动默认善意" in private_system
-    assert "主动带节奏" in private_system
+    assert "当前只能擦边" in private_system
     assert "对方认真纠正时坦然承认" in private_system
 
-    group_system = client._build_system_prompts(None, "", "default:GroupMessage:20002")
-    assert "默认对普通群友友善" in group_system
-    assert "熟人玩笑轻松接住" in group_system
-    assert "讨论 AI、设定或数据库时平静说明身份" in group_system
+    safe_group_system = client._build_system_prompts(
+        None, "", "default:GroupMessage:20002"
+    )
+    assert "默认对普通群友友善" in safe_group_system
+    assert "熟人玩笑轻松接住" in safe_group_system
+    assert "讨论 AI、设定或数据库时平静说明身份" in safe_group_system
+    assert "当前会话尺度｜擦边模式" in safe_group_system
+    assert "主动带节奏" not in safe_group_system
 
+    adult_group_system = client._build_system_prompts(
+        None, "", "default:GroupMessage:775066874"
+    )
+    assert "当前会话尺度｜成人模式" in adult_group_system
+    assert "本会话是私密的成人向角色扮演" in adult_group_system
+
+def test_adult_persona_scope_is_limited_to_whitelisted_groups():
+    """Only configured group chats may receive explicit adult instructions."""
+    sys.path.insert(0, str(PLUGIN))
+    try:
+        from src.llm_client import LLMClient
+    finally:
+        sys.path.pop(0)
+    state = SimpleNamespace(
+        get_last_mood_state=lambda _umo: "中性",
+        get_mood_state_ttl_remaining=lambda _umo: 0,
+        get_self_id=lambda _umo: "",
+        get_self_name=lambda _umo: "",
+    )
+    client = LLMClient(
+        SimpleNamespace(
+            config={
+                "scene_adult_mode": True,
+                "adult_group_whitelist": ["72208748", "775066874", "1009481409"],
+            },
+            state=state,
+        )
+    )
+
+    assert client._is_adult_allowed("default:GroupMessage:72208748")
+    assert client._is_adult_allowed("default:GroupMessage:775066874")
+    assert client._is_adult_allowed("default:GroupMessage:1009481409")
+    assert not client._is_adult_allowed("default:GroupMessage:20002")
+    assert not client._is_adult_allowed("default:FriendMessage:10001")
+    assert not LLMClient(
+        SimpleNamespace(
+            config={
+                "scene_adult_mode": False,
+                "adult_group_whitelist": ["72208748"],
+            },
+            state=state,
+        )
+    )._is_adult_allowed("default:GroupMessage:72208748")
+
+    safe_system = client._build_system_prompts(
+        None, "", "default:GroupMessage:20002", task_type="at"
+    )
+    safe_instructions = client._get_instruction_prompts(
+        task_type="at", is_private=False, adult_allowed=False
+    )
+    for forbidden in (
+        "主动解扣",
+        "详细成人画面",
+        "可以直白说骚话",
+        "描写性行为画面",
+        "每轮至少主动推进",
+        "主动说出想对对方做什么",
+    ):
+        assert forbidden not in safe_system
+        assert forbidden not in safe_instructions
+    assert "当前会话尺度｜擦边模式" in safe_system
+    assert "当前只能擦边" in safe_instructions
+
+    adult_system = client._build_system_prompts(
+        None, "", "default:GroupMessage:775066874", task_type="at"
+    )
+    assert "当前会话尺度｜成人模式" in adult_system
+    assert "主动解扣" in adult_system
 
 def test_at_prompt_uses_proactive_flirty_state_not_previous_sarcasm():
     """An @ reply must not inherit the stale sarcastic mood or lose the persona."""
@@ -415,7 +499,15 @@ def test_at_prompt_uses_proactive_flirty_state_not_previous_sarcasm():
         get_self_id=lambda _umo: "",
         get_self_name=lambda _umo: "",
     )
-    client = LLMClient(SimpleNamespace(config={}, state=state))
+    client = LLMClient(
+        SimpleNamespace(
+            config={
+                "scene_adult_mode": True,
+                "adult_group_whitelist": ["775066874"],
+            },
+            state=state,
+        )
+    )
     rules = client._load_state_rules()
     assert "at" in rules
     at_rule = rules["at"]
